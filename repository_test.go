@@ -610,3 +610,52 @@ func TestPatchIncr(t *testing.T) {
 		}
 	})
 }
+
+func TestUpdateWhere(t *testing.T) {
+	forEach(t, func(t *testing.T, s ablage.Store) {
+		r := customers(t, s)
+		var ids []string
+		for i, tenant := range []string{"t1", "t1", "t1", "t2"} {
+			c := Customer{TenantID: tenant, Email: strconv.Itoa(i), Name: "bulk", Credit: 1}
+			must(t, r.Create(withTenant(context.Background(), tenant), &c))
+			ids = append(ids, c.ID)
+		}
+		must(t, r.Delete(t1, ids[2]))
+		n, err := r.UpdateWhere(t1, ablage.Eq("name", "bulk"), ablage.Row{"status": Status("x"), "credit": ablage.Incr(10)})
+		must(t, err)
+		if n != 2 {
+			t.Errorf("changed %d, want 2 (live, in scope)", n)
+		}
+		list, err := r.Unscoped().WithDeleted().Find(context.Background(), ablage.Query{})
+		must(t, err)
+		for i, c := range list {
+			changed := i < 2
+			if (c.Status == "x") != changed || (c.Credit == 11) != changed || (c.Version == 2) != (i < 3) {
+				t.Errorf("entity %d: status %q, credit %d, version %d", i, c.Status, c.Credit, c.Version)
+			}
+			if changed && !c.UpdatedAt.After(c.CreatedAt) {
+				t.Errorf("entity %d: updated not stamped", i)
+			}
+		}
+		// WithDeleted reaches the deleted one, Unscoped every tenant.
+		n, err = r.WithDeleted().UpdateWhere(t1, ablage.Eq("id", ids[2]), ablage.Row{"name": "gone"})
+		must(t, err)
+		if n != 1 {
+			t.Errorf("WithDeleted changed %d", n)
+		}
+		n, err = r.Unscoped().UpdateWhere(context.Background(), ablage.All, ablage.Row{"credit": ablage.Incr(1)})
+		must(t, err)
+		if n != 3 {
+			t.Errorf("Unscoped changed %d, want 3", n)
+		}
+		for _, set := range []ablage.Row{{}, {"id": "x"}, {"version": 1}, {"updated_at": time.Now()}, {"deleted_at": nil},
+			{"tenant_id": "t2"}, {"nope": 1}, {"name": ablage.Incr(1)}} {
+			if _, err := r.UpdateWhere(t1, ablage.All, set); err == nil {
+				t.Errorf("update %v accepted", set)
+			}
+		}
+		if _, err := r.UpdateWhere(context.Background(), ablage.All, ablage.Row{"name": "x"}); err == nil {
+			t.Error("update without a tenant accepted")
+		}
+	})
+}

@@ -397,17 +397,38 @@ func (r *Repository[T]) Update(ctx context.Context, id string, fn func(*T) error
 
 // Patch sets single fields by column name, without reading the entity
 // first. Values are given as in the struct (e.g. a slice for a JSON field);
-// an Incr adds to an integer field in one atomic step instead. The id, managed fields and fields of the scope cannot be patched. It
-// increments the version and sets updated.
+// an Incr adds to an integer field in one atomic step instead. The id,
+// managed fields and fields of the scope cannot be patched. It increments
+// the version and sets updated. ErrNotFound if the entity does not exist in
+// scope (or is soft-deleted, unless WithDeleted).
 func (r *Repository[T]) Patch(ctx context.Context, id string, set Row) error {
 	if len(set) == 0 {
 		return fmt.Errorf("ablage: Patch of %s %q sets nothing", r.table.Name, id)
+	}
+	n, err := r.UpdateWhere(ctx, Eq("id", id), set)
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return r.notFound(id)
+	}
+	return nil
+}
+
+// UpdateWhere sets fields on every entity matching where, as Patch does for
+// one: values as in the struct, Incr to add, not the id, managed fields or
+// fields of the scope; the version is incremented and updated set on each.
+// Only entities in scope are changed, and soft-deleted ones only WithDeleted.
+// It returns how many entities it changed.
+func (r *Repository[T]) UpdateWhere(ctx context.Context, where Cond, set Row) (int64, error) {
+	if len(set) == 0 {
+		return 0, fmt.Errorf("ablage: update of %s sets nothing", r.table.Name)
 	}
 	var scopeFields []string
 	if r.cfg.scope != nil && !r.unscoped {
 		s, err := r.cfg.scope(ctx)
 		if err != nil {
-			return fmt.Errorf("ablage: scope of %s: %w", r.table.Name, err)
+			return 0, fmt.Errorf("ablage: scope of %s: %w", r.table.Name, err)
 		}
 		scopeFields = s.Fields()
 	}
@@ -415,13 +436,13 @@ func (r *Repository[T]) Patch(ctx context.Context, id string, set Row) error {
 	for name, val := range set {
 		c, ok := r.m.byName[name]
 		if !ok {
-			return fmt.Errorf("ablage: unknown field %s.%s", r.table.Name, name)
+			return 0, fmt.Errorf("ablage: unknown field %s.%s", r.table.Name, name)
 		}
 		if c.role != roleNone {
-			return fmt.Errorf("ablage: %s.%s is managed by the repository and cannot be patched", r.table.Name, name)
+			return 0, fmt.Errorf("ablage: %s.%s is managed by the repository and cannot be patched", r.table.Name, name)
 		}
 		if slices.Contains(scopeFields, name) {
-			return fmt.Errorf("ablage: %s.%s is part of the scope and cannot be patched", r.table.Name, name)
+			return 0, fmt.Errorf("ablage: %s.%s is part of the scope and cannot be patched", r.table.Name, name)
 		}
 		if inc, ok := val.(Incr); ok {
 			// The store adds it; it checks the field is an integer that is
@@ -436,23 +457,16 @@ func (r *Repository[T]) Patch(ctx context.Context, id string, set Row) error {
 			err = c.set(reflect.New(r.m.typ).Elem().FieldByIndex(c.index), cv)
 		}
 		if err != nil {
-			return fmt.Errorf("ablage: %s.%s: %w", r.table.Name, name, err)
+			return 0, fmt.Errorf("ablage: %s.%s: %w", r.table.Name, name, err)
 		}
 		out[name] = cv
 	}
 	r.stamp(out)
-	w, err := r.where(ctx, Eq("id", id))
+	w, err := r.where(ctx, where)
 	if err != nil {
-		return err
+		return 0, err
 	}
-	n, err := r.store.Update(ctx, r.table.Name, out, w)
-	if err != nil {
-		return err
-	}
-	if n == 0 {
-		return r.notFound(id)
-	}
-	return nil
+	return r.store.Update(ctx, r.table.Name, out, w)
 }
 
 // stamp adds the version increment and the updated time to an update.
