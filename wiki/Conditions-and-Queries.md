@@ -36,6 +36,42 @@ projects, _ := projectRepo.GetMany(ctx, ids...) // or Find with ablage.In("id", 
 parameters in one statement (32,766 in SQLite, 65,535 in Postgres): the SQL
 stores pass long lists as a single parameter. Duplicates do not matter.
 
+## Aggregates
+
+Counts, sums, minimums and maximums, overall or per group, without loading
+the rows:
+
+```go
+rows, err := messages.Aggregate(ctx, ablage.Aggregation{
+	Where:   ablage.Eq("mailbox_id", id),
+	GroupBy: []string{"folder_id"},
+	Values:  []ablage.Agg{ablage.CountAll("n"), ablage.Sum("size", "bytes"), ablage.Max("received_at", "latest")},
+})
+for _, r := range rows {
+	fmt.Println(r["folder_id"], r["n"].(int64), r["bytes"].(int64), r["latest"]) // latest: time.Time or nil
+}
+```
+
+| Function | Value |
+| --- | --- |
+| `CountAll(as)` | the number of rows |
+| `Count(f, as)` | the number of rows where `f` is not NULL |
+| `Sum(f, as)` | the sum of an int field; 0 if there are no values; an error if it does not fit into an int64 |
+| `Min(f, as)`, `Max(f, as)` | the smallest / largest value of a string, int, float or time field; NULL if there is none |
+
+NULL values are ignored. The result has one row per group, holding the
+`GroupBy` fields and the values under their names (`int64` for counts and
+sums, the field's type for `Min` and `Max`). Groups are sorted by the
+`GroupBy` fields like a query (NULL first, strings by bytes); NULL forms a
+group of its own. Without `GroupBy` there is exactly one row, also when no
+row matches; with `GroupBy` and no match the result is empty. `GroupBy`
+without values lists the distinct values, so `len(rows)` counts them.
+
+`Repository.Aggregate` adds the scope and the soft delete filter;
+`ablage.Aggregate(ctx, store, table, a)` works on a store, e.g. inside a
+transaction. Several conditions (e.g. all messages and the unread ones) are
+several calls.
+
 ## Sorting and paging
 
 ```go

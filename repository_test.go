@@ -3,6 +3,7 @@ package ablage_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/netip"
 	"slices"
 	"strconv"
@@ -658,4 +659,47 @@ func TestUpdateWhere(t *testing.T) {
 			t.Error("update without a tenant accepted")
 		}
 	})
+}
+
+func TestAggregate(t *testing.T) {
+	forEach(t, func(t *testing.T, s ablage.Store) {
+		r := customers(t, s)
+		for i, c := range []Customer{
+			{TenantID: "t1", Status: "a", Credit: 1}, {TenantID: "t1", Status: "a", Credit: 2},
+			{TenantID: "t1", Status: "b", Credit: 4}, {TenantID: "t1", Status: "b", Credit: 8},
+			{TenantID: "t2", Status: "a", Credit: 16},
+		} {
+			c.Email = strconv.Itoa(i)
+			must(t, r.Create(withTenant(context.Background(), c.TenantID), &c))
+			if i == 3 {
+				must(t, r.Delete(t1, c.ID))
+			}
+		}
+		a := ablage.Aggregation{GroupBy: []string{"status"}, Values: []ablage.Agg{ablage.CountAll("n"), ablage.Sum("credit", "credit")}}
+		check := func(r *ablage.Repository[Customer], ctx context.Context, want string) {
+			t.Helper()
+			got, err := r.Aggregate(ctx, a)
+			must(t, err)
+			if fmt.Sprint(got) != want {
+				t.Errorf("got %v, want %s", got, want)
+			}
+		}
+		check(r, t1, "[map[credit:3 n:2 status:a] map[credit:4 n:1 status:b]]")
+		check(r.WithDeleted(), t1, "[map[credit:3 n:2 status:a] map[credit:12 n:2 status:b]]")
+		check(r.Unscoped(), context.Background(), "[map[credit:19 n:3 status:a] map[credit:4 n:1 status:b]]")
+		if _, err := r.Aggregate(context.Background(), a); err == nil {
+			t.Error("aggregate without a tenant accepted")
+		}
+	})
+}
+
+// plainStore hides every method beyond ablage.Store.
+type plainStore struct{ ablage.Store }
+
+func TestAggregateUnsupported(t *testing.T) {
+	r, err := ablage.NewRepository[Customer](plainStore{ablagememory()}, "customers")
+	must(t, err)
+	must(t, r.Store().Migrate(context.Background()))
+	_, err = r.Aggregate(context.Background(), ablage.Aggregation{Values: []ablage.Agg{ablage.CountAll("n")}})
+	expectErr(t, err, ablage.ErrUnsupported)
 }

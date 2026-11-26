@@ -271,6 +271,25 @@ func (s *Store) Delete(ctx context.Context, table string, where ablage.Cond) (in
 	return n, err
 }
 
+var _ ablage.Aggregator = (*Store)(nil)
+
+// Aggregate implements ablage.Aggregator.
+func (s *Store) Aggregate(ctx context.Context, table string, a ablage.Aggregation) ([]ablage.Row, error) {
+	var out []ablage.Row
+	err := s.run(ctx, func(o *op) error {
+		t, rows, err := o.table(table)
+		if err != nil {
+			return err
+		}
+		if a, err = t.CheckAggregation(a); err != nil {
+			return err
+		}
+		out, err = a.Apply(match(rows, a.Where))
+		return err
+	})
+	return out, err
+}
+
 func match(rows map[string]ablage.Row, where ablage.Cond) []ablage.Row {
 	var out []ablage.Row
 	for _, r := range rows {

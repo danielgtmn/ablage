@@ -53,6 +53,7 @@ func Run(t *testing.T, open Opener) {
 		{"CascadeCount", testCascadeCount},
 		{"LongIn", testLongIn},
 		{"LongInTypes", testLongInTypes},
+		{"Aggregate", testAggregate},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) { tc.fn(t, open) })
@@ -828,4 +829,118 @@ func testLongInTypes(t *testing.T, open Opener) {
 			expectIDs(t, s, "people", ablage.Query{Where: ablage.Not(ablage.In(tc.field, tc.vals[:len(tc.vals)-1]...))}, "5", "null")
 		})
 	}
+}
+
+// Aggregations follow Aggregation.Apply: NULLs ignored, sums of nothing 0,
+// minimum and maximum of nothing NULL, groups sorted by their keys.
+func testAggregate(t *testing.T, open Opener) {
+	s := setup(t, open)
+	ag, ok := s.(ablage.Aggregator)
+	if !ok {
+		t.Skip("the store is not an ablage.Aggregator")
+	}
+	seedPeople(t, s)
+	born := time.Date(1906, 12, 9, 0, 0, 0, 0, time.UTC)
+	_, err := s.Update(ctx, "people", ablage.Row{"born": born, "visits": 7}, ablage.Eq("id", "3"))
+	must(t, err)
+	_, err = s.Update(ctx, "people", ablage.Row{"born": born.AddDate(10, 0, 0), "visits": -2}, ablage.Eq("id", "4"))
+	must(t, err)
+	all := []ablage.Agg{
+		ablage.CountAll("n"), ablage.Count("age", "aged"), ablage.Sum("age", "ages"), ablage.Sum("visits", "visits"),
+		ablage.Min("age", "youngest"), ablage.Max("age", "oldest"), ablage.Min("name", "first"), ablage.Max("name", "last"),
+		ablage.Min("score", "low"), ablage.Max("score", "high"), ablage.Min("born", "born_first"), ablage.Max("born", "born_last"),
+	}
+	cases := []struct {
+		name string
+		a    ablage.Aggregation
+		want []ablage.Row
+	}{
+		{"all rows", ablage.Aggregation{Values: all}, []ablage.Row{{
+			"n": int64(5), "aged": int64(4), "ages": int64(198), "visits": int64(5), "youngest": int64(36), "oldest": int64(85),
+			"first": "Ada", "last": "Ünal", "low": -2.0, "high": 1.5, "born_first": born, "born_last": born.AddDate(10, 0, 0),
+		}}},
+		{"no rows", ablage.Aggregation{Where: ablage.Eq("id", "nope"), Values: all}, []ablage.Row{{
+			"n": int64(0), "aged": int64(0), "ages": int64(0), "visits": int64(0), "youngest": nil, "oldest": nil,
+			"first": nil, "last": nil, "low": nil, "high": nil, "born_first": nil, "born_last": nil,
+		}}},
+		{"only NULLs", ablage.Aggregation{Where: ablage.Eq("id", "4"), Values: []ablage.Agg{ablage.Count("age", "c"), ablage.Sum("age", "s"), ablage.Max("age", "m")}},
+			[]ablage.Row{{"c": int64(0), "s": int64(0), "m": nil}}},
+		{"group by bool", ablage.Aggregation{GroupBy: []string{"active"}, Values: []ablage.Agg{ablage.CountAll("n"), ablage.Sum("age", "ages")}},
+			[]ablage.Row{{"active": false, "n": int64(2), "ages": int64(41)}, {"active": true, "n": int64(3), "ages": int64(157)}}},
+		{"group by with NULL first", ablage.Aggregation{GroupBy: []string{"age"}, Values: []ablage.Agg{ablage.CountAll("n"), ablage.Max("name", "name")}},
+			[]ablage.Row{
+				{"age": nil, "n": int64(1), "name": "grace"}, {"age": int64(36), "n": int64(2), "name": "Ünal"},
+				{"age": int64(41), "n": int64(1), "name": "Alan"}, {"age": int64(85), "n": int64(1), "name": "Grace"},
+			}},
+		{"group by two fields, with where", ablage.Aggregation{Where: ablage.Ne("id", "2"), GroupBy: []string{"active", "email"}, Values: []ablage.Agg{ablage.CountAll("n")}},
+			[]ablage.Row{
+				{"active": false, "email": nil, "n": int64(1)}, {"active": true, "email": nil, "n": int64(1)},
+				{"active": true, "email": "ada@x", "n": int64(1)}, {"active": true, "email": "u@x", "n": int64(1)},
+			}},
+		{"group by strings in byte order", ablage.Aggregation{GroupBy: []string{"name"}},
+			[]ablage.Row{{"name": "Ada"}, {"name": "Alan"}, {"name": "Grace"}, {"name": "grace"}, {"name": "Ünal"}}},
+		{"groups of no rows", ablage.Aggregation{Where: ablage.Eq("id", "nope"), GroupBy: []string{"age"}, Values: all}, []ablage.Row{}},
+		{"long list in where", ablage.Aggregation{Where: ablage.In("id", append(pad(1000), "1", "5")...), GroupBy: []string{"age"}, Values: []ablage.Agg{ablage.CountAll("n")}},
+			[]ablage.Row{{"age": int64(36), "n": int64(2)}}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := ag.Aggregate(ctx, "people", tc.a)
+			must(t, err)
+			if got == nil || fmt.Sprint(got) != fmt.Sprint(tc.want) {
+				t.Errorf("got  %v\nwant %v", got, tc.want)
+			}
+			// The package function does the same on any store.
+			again, err := ablage.Aggregate(ctx, s, "people", tc.a)
+			must(t, err)
+			if fmt.Sprint(again) != fmt.Sprint(got) {
+				t.Errorf("ablage.Aggregate: %v", again)
+			}
+		})
+	}
+	bad := []ablage.Aggregation{
+		{},
+		{Values: []ablage.Agg{ablage.Sum("name", "x")}},
+		{Values: []ablage.Agg{ablage.Sum("score", "x")}},
+		{Values: []ablage.Agg{ablage.Min("active", "x")}},
+		{Values: []ablage.Agg{ablage.Max("avatar", "x")}},
+		{Values: []ablage.Agg{ablage.Max("tags", "x")}},
+		{Values: []ablage.Agg{ablage.Count("nope", "x")}},
+		{Values: []ablage.Agg{ablage.CountAll("Bad-Name")}},
+		{Values: []ablage.Agg{ablage.CountAll("")}},
+		{Values: []ablage.Agg{ablage.CountAll("x"), ablage.Count("age", "x")}},
+		{GroupBy: []string{"age"}, Values: []ablage.Agg{ablage.CountAll("age")}},
+		{GroupBy: []string{"tags"}},
+		{GroupBy: []string{"age", "age"}},
+		{GroupBy: []string{"nope"}},
+		{Values: []ablage.Agg{{Op: 0, As: "x"}}},
+		{Where: ablage.Eq("nope", 1), Values: []ablage.Agg{ablage.CountAll("n")}},
+	}
+	for _, a := range bad {
+		if _, err := ag.Aggregate(ctx, "people", a); err == nil {
+			t.Errorf("invalid aggregation %+v accepted", a)
+		}
+	}
+	// A sum fits if the total fits, whatever the order of adding up; one
+	// that does not fit into an int64 fails.
+	insert(t, s, "people", ablage.Row{"id": "big1", "name": "big", "visits": int64(math.MaxInt64)})
+	insert(t, s, "people", ablage.Row{"id": "big2", "name": "big", "visits": int64(math.MaxInt64) - 5})
+	insert(t, s, "people", ablage.Row{"id": "big3", "name": "big", "visits": int64(math.MinInt64)})
+	got, err := ag.Aggregate(ctx, "people", ablage.Aggregation{Values: []ablage.Agg{ablage.Sum("visits", "v")}})
+	must(t, err)
+	if want := int64(math.MaxInt64) - 1; got[0]["v"] != want {
+		t.Errorf("sum %v, want %d", got[0]["v"], want)
+	}
+	must(t, s.Insert(ctx, "people", ablage.Row{"id": "big4", "name": "big", "visits": 2}))
+	if _, err := ag.Aggregate(ctx, "people", ablage.Aggregation{Values: []ablage.Agg{ablage.Sum("visits", "v")}}); err == nil {
+		t.Error("overflowing sum accepted")
+	}
+}
+
+func pad(n int) []string {
+	out := make([]string, n)
+	for i := range out {
+		out[i] = fmt.Sprintf("pad%d", i)
+	}
+	return out
 }

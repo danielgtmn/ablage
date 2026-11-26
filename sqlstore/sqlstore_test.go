@@ -276,6 +276,22 @@ func TestMigrateAdoptsExistingTable(t *testing.T) {
 			if n, _ := s.Count(ctx, "users", ablage.Prefix("name", "a")); n != 2 {
 				t.Errorf("names starting with a: %d, want 2", n)
 			}
+			// Aggregates compare by bytes too.
+			agg, err := s.Aggregate(ctx, "users", ablage.Aggregation{GroupBy: []string{"name"},
+				Values: []ablage.Agg{ablage.Min("name", "lo"), ablage.Max("email", "hi")}})
+			must(t, err)
+			got = got[:0]
+			for _, r := range agg {
+				got = append(got, r["name"].(string))
+			}
+			if want := "B a ab b Ä"; strings.Join(got, " ") != want {
+				t.Errorf("groups %v, want %s", got, want)
+			}
+			agg, err = s.Aggregate(ctx, "users", ablage.Aggregation{Values: []ablage.Agg{ablage.Min("name", "lo"), ablage.Max("name", "hi")}})
+			must(t, err)
+			if agg[0]["lo"] != "B" || agg[0]["hi"] != "Ä" {
+				t.Errorf("min and max %v, want B and Ä", agg[0])
+			}
 		})
 	}
 }
