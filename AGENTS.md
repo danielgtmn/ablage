@@ -47,7 +47,8 @@ scripts/           commit-type.sh (Conventional Commits check) and its test
   Fields that are not nullable get a default (their zero value), so rows of
   older versions stay valid. The one exception: indexes ablage created
   (names ending in `_<8 hex>_key|idx`) that are no longer declared are
-  dropped.
+  dropped, and indexes of tables from before ablage that are
+  identical to a declared one are replaced by ablage's own.
 - **Values every store keeps alike, nothing else.** `convert` in value.go
   refuses what one store would change (invalid UTF-8, NUL, NaN, years
   outside 1-9999). A new type or operator needs the same care.

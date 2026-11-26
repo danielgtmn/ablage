@@ -263,8 +263,12 @@ func (s *Store) syncIndexes(ctx context.Context, t ablage.Table) error {
 	if err != nil {
 		return fmt.Errorf("sqlstore: read indexes of %s: %w", t.Name, err)
 	}
+	adopt, err := s.adoptIndexes(ctx, t)
+	if err != nil {
+		return err
+	}
 	for name := range have {
-		if !managedIndex.MatchString(name) || slices.ContainsFunc(want, func(ix index) bool { return ix.name == name }) {
+		if !adopt[name] && (!managedIndex.MatchString(name) || slices.ContainsFunc(want, func(ix index) bool { return ix.name == name })) {
 			continue
 		}
 		if _, err := s.q.ExecContext(ctx, "DROP INDEX "+quote(name)); err != nil {
@@ -277,6 +281,49 @@ func (s *Store) syncIndexes(ctx context.Context, t ablage.Table) error {
 		}
 	}
 	return nil
+}
+
+// plainIndex is an index over columns as they are (no expressions, no
+// condition, ascending, the column's collation, the default operator
+// class), as ablage creates them on tables without soft delete.
+type plainIndex struct {
+	name    string
+	unique  bool
+	columns []string
+}
+
+// adoptIndexes returns the indexes of t that ablage did not create but that
+// are identical to one it is about to create: same columns in the same
+// order, same uniqueness, and no condition on either. They come from
+// tables created before the app used ablage (or by hand); Migrate replaces
+// them by its own, so the table does not end up with every index twice.
+// Nothing changes for the data: the new index enforces exactly the same.
+func (s *Store) adoptIndexes(ctx context.Context, t ablage.Table) (map[string]bool, error) {
+	var plain []ablage.Index
+	for _, ix := range t.AllIndexes() {
+		if !ix.Unique || t.SoftDelete == "" {
+			plain = append(plain, ix)
+		}
+	}
+	if len(plain) == 0 {
+		return nil, nil
+	}
+	have, err := s.d.plainIndexes(ctx, s.q, s.prefix+t.Name)
+	if err != nil {
+		return nil, fmt.Errorf("sqlstore: read indexes of %s: %w", t.Name, err)
+	}
+	out := map[string]bool{}
+	for _, h := range have {
+		if managedIndex.MatchString(h.name) {
+			continue
+		}
+		if slices.ContainsFunc(plain, func(ix ablage.Index) bool {
+			return ix.Unique == h.unique && slices.Equal(ix.Fields, h.columns)
+		}) {
+			out[h.name] = true
+		}
+	}
+	return out, nil
 }
 
 func (s *Store) columns(ctx context.Context, table string) (map[string]bool, error) {
@@ -414,13 +461,13 @@ func (s *Store) where(t ablage.Table, c ablage.Cond, p *args, qual string) strin
 	case ablage.OpNe:
 		return s.d.ne(col(c.Field), p.add(f.Type, c.Value))
 	case ablage.OpLt:
-		return col(c.Field) + " < " + p.add(f.Type, c.Value)
+		return s.d.ordered(col(c.Field), f.Type) + " < " + p.add(f.Type, c.Value)
 	case ablage.OpLte:
-		return col(c.Field) + " <= " + p.add(f.Type, c.Value)
+		return s.d.ordered(col(c.Field), f.Type) + " <= " + p.add(f.Type, c.Value)
 	case ablage.OpGt:
-		return col(c.Field) + " > " + p.add(f.Type, c.Value)
+		return s.d.ordered(col(c.Field), f.Type) + " > " + p.add(f.Type, c.Value)
 	case ablage.OpGte:
-		return col(c.Field) + " >= " + p.add(f.Type, c.Value)
+		return s.d.ordered(col(c.Field), f.Type) + " >= " + p.add(f.Type, c.Value)
 	case ablage.OpIn:
 		list := c.Value.([]any)
 		if len(list) == 0 {
@@ -435,9 +482,10 @@ func (s *Store) where(t ablage.Table, c ablage.Cond, p *args, qual string) strin
 		// A range instead of LIKE: case-sensitive in both dialects, no
 		// escaping, and it uses an index.
 		prefix := c.Value.(string)
-		lower := col(c.Field) + " >= " + p.add(f.Type, prefix)
+		column := s.d.ordered(col(c.Field), f.Type)
+		lower := column + " >= " + p.add(f.Type, prefix)
 		if upper, ok := successor(prefix); ok {
-			return lower + " AND " + col(c.Field) + " < " + p.add(f.Type, upper)
+			return lower + " AND " + column + " < " + p.add(f.Type, upper)
 		}
 		return lower
 	}
@@ -558,7 +606,8 @@ func (s *Store) Find(ctx context.Context, table string, q ablage.Query) ([]ablag
 	b.WriteString("SELECT " + s.selectCols(t) + " FROM " + s.tableName(t.Name) + " WHERE " + s.where(t, q.Where, p, ""))
 	order := make([]string, len(q.OrderBy))
 	for i, o := range q.OrderBy {
-		order[i] = quote(o.Field) + s.d.nullsOrder(o.Desc)
+		f, _ := t.Field(o.Field)
+		order[i] = s.d.ordered(quote(o.Field), f.Type) + s.d.nullsOrder(o.Desc)
 	}
 	b.WriteString(" ORDER BY " + strings.Join(order, ", "))
 	if q.Limit > 0 {
