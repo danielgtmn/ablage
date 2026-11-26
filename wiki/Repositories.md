@@ -40,6 +40,7 @@ Tag options after the name, e.g. `db:"mail,unique"` or `db:",version"`:
 | `Get(ctx, id)` | `ErrNotFound` if missing, deleted or out of scope |
 | `GetMany(ctx, ids...)` | the ones that exist |
 | `Find(ctx, query)`, `First(ctx, query)`, `Count(ctx, cond)`, `Exists(ctx, id)` | see [Conditions and queries](Conditions-and-Queries) |
+| `Aggregate(ctx, ablage.Aggregation{...})` | counts, sums, minimums, maximums, optionally per group; see [Aggregates](Conditions-and-Queries#aggregates) |
 | `Replace(ctx, &e)` | writes all fields but id, created and deleted (`e` keeps whatever it holds there); checks the version |
 | `Update(ctx, id, fn)` | reads, applies `fn`, replaces; retries on `ErrStale` (5 attempts, `WithUpdateAttempts`). `fn` may run more than once: no side effects in it. Changes `fn` makes to the id, version, created or deleted field are refused or ignored |
 | `Patch(ctx, id, ablage.Row{"name": "x"})` | sets single columns without reading; values as in the struct, `ablage.Incr(n)` adds `n` to an integer field in one atomic step. Not for the id, managed fields or scope fields. Increments the version, sets updated |

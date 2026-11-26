@@ -10,6 +10,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math/big"
 	"regexp"
 	"slices"
 	"strings"
@@ -789,4 +790,122 @@ func selfCascade(t ablage.Table) bool {
 		}
 	}
 	return false
+}
+
+var _ ablage.Aggregator = (*Store)(nil)
+
+// Aggregate implements ablage.Aggregator.
+func (s *Store) Aggregate(ctx context.Context, table string, a ablage.Aggregation) ([]ablage.Row, error) {
+	t, err := s.table(table)
+	if err != nil {
+		return nil, err
+	}
+	if a, err = t.CheckAggregation(a); err != nil {
+		return nil, err
+	}
+	p := &args{d: s.d}
+	type out struct {
+		name string
+		typ  ablage.Type
+		sum  bool // two columns: the sums of the high and low 32 bits
+	}
+	var cols []string
+	var outs []out
+	for _, g := range a.GroupBy {
+		f, _ := t.Field(g)
+		cols = append(cols, s.d.selectExpr(quote(g), f.Type))
+		outs = append(outs, out{name: g, typ: f.Type})
+	}
+	for _, v := range a.Values {
+		col := "*"
+		if v.Field != "" {
+			col = quote(v.Field)
+		}
+		f, _ := t.Field(v.Field)
+		switch v.Op {
+		case ablage.AggCount:
+			cols = append(cols, "COUNT("+col+")")
+			outs = append(outs, out{name: v.As, typ: ablage.Int})
+		case ablage.AggSum:
+			// In two halves, so no partial sum can overflow (SQLite would
+			// fail on one even if the total fits): high 32 bits (shifted
+			// with the sign) and low 32 bits, added up in Go.
+			// Each half fits into a BIGINT for up to 2^31 rows.
+			cols = append(cols, "CAST(COALESCE(SUM("+col+" >> 32), 0) AS BIGINT)", "CAST(COALESCE(SUM("+col+" & 4294967295), 0) AS BIGINT)")
+			outs = append(outs, out{name: v.As, typ: ablage.Int, sum: true})
+		case ablage.AggMin:
+			cols = append(cols, "MIN("+s.d.ordered(col, f.Type)+")")
+			outs = append(outs, out{name: v.As, typ: f.Type})
+		case ablage.AggMax:
+			cols = append(cols, "MAX("+s.d.ordered(col, f.Type)+")")
+			outs = append(outs, out{name: v.As, typ: f.Type})
+		}
+	}
+	var b strings.Builder
+	b.WriteString("SELECT " + strings.Join(cols, ", ") + " FROM " + s.tableName(t.Name) + " WHERE " + s.where(t, a.Where, p, ""))
+	if len(a.GroupBy) > 0 {
+		group := make([]string, len(a.GroupBy))
+		order := make([]string, len(a.GroupBy))
+		for i, g := range a.GroupBy {
+			f, _ := t.Field(g)
+			group[i] = quote(g)
+			order[i] = s.d.ordered(quote(g), f.Type) + s.d.nullsOrder(false)
+		}
+		b.WriteString(" GROUP BY " + strings.Join(group, ", ") + " ORDER BY " + strings.Join(order, ", "))
+	}
+	rows, err := s.query(ctx, b.String(), p.vals)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	result := []ablage.Row{}
+	for rows.Next() {
+		vals := make([]any, len(cols))
+		ptrs := make([]any, len(cols))
+		for i := range vals {
+			ptrs[i] = &vals[i]
+		}
+		if err := rows.Scan(ptrs...); err != nil {
+			return nil, err
+		}
+		row := make(ablage.Row, len(outs))
+		i := 0
+		for _, o := range outs {
+			if o.sum {
+				v, err := s.sum(vals[i], vals[i+1])
+				if err != nil {
+					return nil, fmt.Errorf("%w (%s.%s)", err, t.Name, o.name)
+				}
+				row[o.name] = v
+				i += 2
+				continue
+			}
+			v, err := s.d.decode(o.typ, vals[i])
+			if err != nil {
+				return nil, fmt.Errorf("%w (%s.%s)", err, t.Name, o.name)
+			}
+			row[o.name] = v
+			i++
+		}
+		result = append(result, row)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("sqlstore: aggregate %s: %w", t.Name, err)
+	}
+	return result, nil
+}
+
+// sum adds the sums of the high and low halves of an Int column.
+func (s *Store) sum(hi, lo any) (int64, error) {
+	h, ok1 := hi.(int64)
+	l, ok2 := lo.(int64)
+	if !ok1 || !ok2 {
+		return 0, fmt.Errorf("sqlstore: cannot read the sum from %T and %T", hi, lo)
+	}
+	total := new(big.Int).Lsh(big.NewInt(h), 32)
+	total.Add(total, big.NewInt(l))
+	if !total.IsInt64() {
+		return 0, errors.New("sqlstore: the sum does not fit into an int64")
+	}
+	return total.Int64(), nil
 }

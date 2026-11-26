@@ -53,6 +53,7 @@ customers.Delete(ctx, c.ID) // soft delete: the email is free again
   is an error, never "all tenants".
 - **Optimistic concurrency** with a version field: `Replace` fails with
   `ErrStale`, `Update` retries.
+- **Aggregates**: count, sum, min and max, overall or grouped by fields.
 - **Soft delete** with `Restore` and `Purge`; unique indexes only count rows
   that are not deleted.
 - **References** between tables with cascade, set-null or restrict, enforced
@@ -62,7 +63,7 @@ customers.Delete(ctx, c.ID) // soft delete: the email is free again
 - **Transactions** with `store.Tx` and `repo.With(tx)`.
 
 Errors to test with `errors.Is`: `ErrNotFound`, `ErrDuplicate`,
-`ErrReference`, `ErrStale`, `ErrOutOfScope`.
+`ErrReference`, `ErrStale`, `ErrOutOfScope`, `ErrUnsupported`.
 
 ## Install
 

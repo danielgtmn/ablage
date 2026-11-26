@@ -24,6 +24,9 @@ var (
 	// ErrOutOfScope: the row is outside the repository's scope, e.g. it
 	// belongs to another tenant.
 	ErrOutOfScope = errors.New("ablage: out of scope")
+	// ErrUnsupported: the store lacks an optional interface the operation
+	// needs, e.g. Aggregator.
+	ErrUnsupported = errors.New("ablage: not supported by the store")
 )
 
 // Store keeps rows in tables. Implementations: sqlstore (SQLite, Postgres)
@@ -34,6 +37,9 @@ var (
 // their field (see Type and Field.Value). Conditions are evaluated as
 // Cond.Match does; an In list may hold any number of values (tens of
 // thousands), in every operation.
+//
+// Optional interfaces add operations: Aggregator. Every store of this
+// module implements them; storetest checks them where present.
 type Store interface {
 	// Declare adds tables to the store; see Catalog.Declare. Usually called
 	// by NewRepository. Declare all tables, then Migrate.

@@ -242,6 +242,20 @@ func (r *Repository[T]) Count(ctx context.Context, where Cond) (int64, error) {
 	return r.store.Count(ctx, r.table.Name, w)
 }
 
+// Aggregate computes counts, sums, minimums and maximums over the entities
+// matching a.Where, per group of a.GroupBy (see Aggregation). Scope and soft
+// delete apply as in Find. Result rows hold canonical values by column name
+// (e.g. an int64 for counts and sums). ErrUnsupported if the store is not an
+// Aggregator.
+func (r *Repository[T]) Aggregate(ctx context.Context, a Aggregation) ([]Row, error) {
+	w, err := r.where(ctx, a.Where)
+	if err != nil {
+		return nil, err
+	}
+	a.Where = w
+	return Aggregate(ctx, r.store, r.table.Name, a)
+}
+
 // Exists reports whether an entity with the id exists in scope.
 func (r *Repository[T]) Exists(ctx context.Context, id string) (bool, error) {
 	n, err := r.Count(ctx, Eq("id", id))
