@@ -599,8 +599,18 @@ func (s *Store) set(t ablage.Table, set ablage.Row, p *args, qual string) string
 
 // Upsert implements ablage.Store.
 func (s *Store) Upsert(ctx context.Context, table string, row, update ablage.Row, where ablage.Cond) (bool, error) {
+	return s.UpsertOn(ctx, table, []string{"id"}, row, update, where)
+}
+
+var _ ablage.UniqueUpserter = (*Store)(nil)
+
+// UpsertOn implements ablage.UniqueUpserter.
+func (s *Store) UpsertOn(ctx context.Context, table string, on []string, row, update ablage.Row, where ablage.Cond) (bool, error) {
 	t, err := s.table(table)
 	if err != nil {
+		return false, err
+	}
+	if on, err = t.CheckConflict(on); err != nil {
 		return false, err
 	}
 	if row, err = t.CheckInsert(row); err != nil {
@@ -618,7 +628,17 @@ func (s *Store) Upsert(ctx context.Context, table string, row, update ablage.Row
 	if set == "" {
 		set = quote("id") + " = " + qual + quote("id")
 	}
-	stmt += " ON CONFLICT (" + quote("id") + ") DO UPDATE SET " + set + " WHERE " + s.where(t, where, p, qual)
+	target := make([]string, len(on))
+	for i, f := range on {
+		target[i] = quote(f)
+	}
+	stmt += " ON CONFLICT (" + strings.Join(target, ", ") + ")"
+	if on[0] != "id" && t.SoftDelete != "" {
+		// The index covers live rows only; naming its condition lets the
+		// database find it.
+		stmt += " WHERE " + quote(t.SoftDelete) + " IS NULL"
+	}
+	stmt += " DO UPDATE SET " + set + " WHERE " + s.where(t, where, p, qual)
 	res, err := s.exec(ctx, stmt, p.vals)
 	if err != nil {
 		return false, err

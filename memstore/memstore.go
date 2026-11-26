@@ -142,10 +142,20 @@ func (s *Store) Insert(ctx context.Context, table string, row ablage.Row) error 
 
 // Upsert implements ablage.Store.
 func (s *Store) Upsert(ctx context.Context, table string, row, update ablage.Row, where ablage.Cond) (bool, error) {
+	return s.UpsertOn(ctx, table, []string{"id"}, row, update, where)
+}
+
+var _ ablage.UniqueUpserter = (*Store)(nil)
+
+// UpsertOn implements ablage.UniqueUpserter.
+func (s *Store) UpsertOn(ctx context.Context, table string, on []string, row, update ablage.Row, where ablage.Cond) (bool, error) {
 	var matched bool
 	err := s.run(ctx, func(o *op) error {
 		t, rows, err := o.table(table)
 		if err != nil {
+			return err
+		}
+		if on, err = t.CheckConflict(on); err != nil {
 			return err
 		}
 		if row, err = t.CheckInsert(row); err != nil {
@@ -157,8 +167,18 @@ func (s *Store) Upsert(ctx context.Context, table string, row, update ablage.Row
 		if where, err = t.CheckCond(where); err != nil {
 			return err
 		}
-		have, ok := rows[row["id"].(string)]
-		if !ok {
+		var have ablage.Row
+		if on[0] == "id" {
+			have = rows[row["id"].(string)]
+		} else {
+			for _, r := range rows {
+				if t.Conflicts(on, row, r) {
+					have = r
+					break
+				}
+			}
+		}
+		if have == nil {
 			matched = true
 			return o.insert(t, rows, row)
 		}

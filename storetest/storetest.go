@@ -54,6 +54,7 @@ func Run(t *testing.T, open Opener) {
 		{"LongIn", testLongIn},
 		{"LongInTypes", testLongInTypes},
 		{"Aggregate", testAggregate},
+		{"UpsertOn", testUpsertOn},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) { tc.fn(t, open) })
@@ -943,4 +944,111 @@ func pad(n int) []string {
 		out[i] = fmt.Sprintf("pad%d", i)
 	}
 	return out
+}
+
+// UpsertOn conflicts on a unique index: same values, none NULL, live rows
+// only with soft delete; the existing row keeps its id.
+func testUpsertOn(t *testing.T, open Opener) {
+	members := ablage.Table{Name: "members", Fields: []ablage.Field{
+		{Name: "tenant", Type: ablage.String},
+		{Name: "email", Type: ablage.String, Nullable: true},
+		{Name: "code", Type: ablage.String, Nullable: true, Unique: true},
+		{Name: "name", Type: ablage.String},
+		{Name: "visits", Type: ablage.Int},
+		{Name: "deleted_at", Type: ablage.Time, Nullable: true},
+	}, Indexes: []ablage.Index{{Fields: []string{"tenant", "email"}, Unique: true}}, SoftDelete: "deleted_at"}
+	s := setup(t, open, members, people)
+	u, ok := s.(ablage.UniqueUpserter)
+	if !ok {
+		t.Skip("the store is not an ablage.UniqueUpserter")
+	}
+	on := []string{"email", "tenant"} // any order
+	up := func(row, update ablage.Row, where ablage.Cond) bool {
+		t.Helper()
+		ok, err := u.UpsertOn(ctx, "members", on, row, update, where)
+		must(t, err)
+		return ok
+	}
+	expect := func(id string, want string) {
+		t.Helper()
+		r := get(t, s, "members", id)
+		if got := fmt.Sprintf("%v %v %v", r["name"], r["visits"], r["deleted_at"] != nil); got != want {
+			t.Errorf("%s: %s, want %s", id, got, want)
+		}
+	}
+	bump := ablage.Row{"name": "again", "visits": ablage.Incr(1)}
+	if !up(ablage.Row{"id": "a", "tenant": "t1", "email": "x", "name": "first"}, bump, ablage.All) {
+		t.Error("insert reports false")
+	}
+	expect("a", "first 0 false")
+	// The same values under another id update the existing row.
+	if !up(ablage.Row{"id": "b", "tenant": "t1", "email": "x", "name": "second"}, bump, ablage.All) {
+		t.Error("update reports false")
+	}
+	expect("a", "again 1 false")
+	expectIDs(t, s, "members", ablage.Query{}, "a")
+	// Not matching where: nothing changes.
+	if up(ablage.Row{"id": "b", "tenant": "t1", "email": "x"}, bump, ablage.Eq("name", "nope")) {
+		t.Error("upsert not matching where reports true")
+	}
+	if !up(ablage.Row{"id": "b", "tenant": "t1", "email": "x"}, ablage.Row{}, ablage.Eq("name", "again")) {
+		t.Error("empty update of a matching row reports false")
+	}
+	expect("a", "again 1 false")
+	// Other values, and NULL, do not conflict.
+	up(ablage.Row{"id": "c", "tenant": "t2", "email": "x", "name": "c"}, bump, ablage.All)
+	up(ablage.Row{"id": "d", "tenant": "t1", "name": "d"}, bump, ablage.All)
+	up(ablage.Row{"id": "e", "tenant": "t1", "name": "e"}, bump, ablage.All)
+	expectIDs(t, s, "members", ablage.Query{}, "a", "c", "d", "e")
+	// A deleted row does not conflict, nor does a deleted row being written.
+	_, err := s.Update(ctx, "members", ablage.Row{"deleted_at": time.Now()}, ablage.Eq("id", "a"))
+	must(t, err)
+	up(ablage.Row{"id": "f", "tenant": "t1", "email": "x", "name": "f"}, bump, ablage.All)
+	up(ablage.Row{"id": "g", "tenant": "t1", "email": "x", "name": "g", "deleted_at": time.Now()}, bump, ablage.All)
+	expect("a", "again 1 true")
+	expect("f", "f 0 false")
+	expect("g", "g 0 true")
+	// The conflict on the index wins over the id: the row with the values
+	// is updated, not the one with the id.
+	up(ablage.Row{"id": "c", "tenant": "t1", "email": "x"}, bump, ablage.All)
+	expect("f", "again 1 false")
+	expect("c", "c 0 false")
+	// Other unique values and a taken id fail as in Insert.
+	up(ablage.Row{"id": "h", "tenant": "t3", "email": "y", "code": "k"}, bump, ablage.All)
+	for _, row := range []ablage.Row{
+		{"id": "i", "tenant": "t3", "email": "z", "code": "k"},
+		{"id": "c", "tenant": "t3", "email": "z"},
+	} {
+		if _, err := u.UpsertOn(ctx, "members", on, row, bump, ablage.All); !errors.Is(err, ablage.ErrDuplicate) {
+			t.Errorf("upsert of %v: %v, want ErrDuplicate", row, err)
+		}
+	}
+	if _, err := u.UpsertOn(ctx, "members", on, ablage.Row{"id": "a", "tenant": "t1", "email": "x"}, ablage.Row{"code": "k"}, ablage.All); !errors.Is(err, ablage.ErrDuplicate) {
+		t.Errorf("update to a taken value: %v", err)
+	}
+	// A single unique field; the id, as Upsert.
+	ok, err = u.UpsertOn(ctx, "members", []string{"code"}, ablage.Row{"id": "j", "tenant": "t9", "code": "k"}, ablage.Row{"name": "by code"}, ablage.All)
+	must(t, err)
+	if !ok {
+		t.Error("upsert on code reports false")
+	}
+	expect("h", "by code 0 false")
+	ok, err = ablage.UpsertOn(ctx, s, "members", []string{"id"}, ablage.Row{"id": "h", "tenant": "x"}, ablage.Row{"name": "by id"}, ablage.All)
+	must(t, err)
+	if !ok {
+		t.Error("upsert on id reports false")
+	}
+	expect("h", "by id 0 false")
+	// Without soft delete.
+	insert(t, s, "people", ablage.Row{"id": "1", "name": "Ada", "email": "ada@x"})
+	_, err = ablage.UpsertOn(ctx, s, "people", []string{"email"}, ablage.Row{"id": "2", "name": "x", "email": "ada@x"}, ablage.Row{"visits": ablage.Incr(5)}, ablage.All)
+	must(t, err)
+	if r := get(t, s, "people", "1"); r["visits"] != int64(5) || r["name"] != "Ada" {
+		t.Errorf("people: %v", r)
+	}
+	for _, bad := range [][]string{nil, {"name"}, {"tenant"}, {"tenant", "email", "name"}, {"nope"}} {
+		if _, err := u.UpsertOn(ctx, "members", bad, ablage.Row{"id": "z", "tenant": "t"}, bump, ablage.All); err == nil {
+			t.Errorf("conflict target %v accepted", bad)
+		}
+	}
 }

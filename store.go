@@ -38,7 +38,8 @@ var (
 // Cond.Match does; an In list may hold any number of values (tens of
 // thousands), in every operation.
 //
-// Optional interfaces add operations: Aggregator. Every store of this
+// Optional interfaces add operations: Aggregator and UniqueUpserter. Every
+// store of this
 // module implements them; storetest checks them where present.
 type Store interface {
 	// Declare adds tables to the store; see Catalog.Declare. Usually called

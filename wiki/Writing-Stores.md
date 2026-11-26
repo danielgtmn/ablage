@@ -19,6 +19,7 @@ Optional interfaces, which every store of this module implements and the
 suite tests when a store has them:
 
 - `ablage.Aggregator` (`Aggregate`): check with `Table.CheckAggregation`; `Aggregation.Apply` defines the result. Without it, `ablage.Aggregate` and `Repository.Aggregate` fail with `ErrUnsupported`.
+- `ablage.UniqueUpserter` (`UpsertOn`): `Upsert` with the conflict on a unique index. `Table.CheckConflict` finds the index, `Table.Conflicts` defines a conflict; the conflict on the index is checked before the id and other unique values. Without it, `ablage.UpsertOn` and `Repository.UpsertOn` fail with `ErrUnsupported`.
 
 `memstore` is the reference implementation.
 
