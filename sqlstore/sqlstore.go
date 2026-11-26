@@ -381,6 +381,9 @@ func (s *Store) Tx(ctx context.Context, fn func(ablage.Store) error) error {
 // a failed statement (e.g. a duplicate) leaves the transaction usable, as
 // it does in SQLite and memory.
 func (s *Store) exec(ctx context.Context, stmt string, vals []any) (sql.Result, error) {
+	if err := s.checkArgs(vals); err != nil {
+		return nil, err
+	}
 	if _, pg := s.d.(postgresDialect); !pg || !s.inTx {
 		res, err := s.q.ExecContext(ctx, stmt, vals...)
 		return res, s.wrap(err)
@@ -420,8 +423,36 @@ type args struct {
 }
 
 func (p *args) add(t ablage.Type, v any) string {
-	p.vals = append(p.vals, p.d.encode(t, v))
+	return p.addRaw(p.d.encode(t, v))
+}
+
+// addRaw adds a parameter that is already in the form the driver takes.
+func (p *args) addRaw(v any) string {
+	p.vals = append(p.vals, v)
 	return p.d.placeholder(len(p.vals))
+}
+
+// longList is the length from which an In list goes into the statement as
+// one parameter (see dialect.inList) instead of one per value.
+const longList = 100
+
+// checkArgs refuses a statement with more parameters than the database
+// takes, with an error that says so instead of the driver's. Only
+// conditions with thousands of comparisons get there; long In lists take one
+// parameter.
+func (s *Store) checkArgs(vals []any) error {
+	if max := s.d.maxParams(); len(vals) > max {
+		return fmt.Errorf("sqlstore: the statement needs %d parameters, %s takes at most %d (use In for long lists of values)", len(vals), s.d.name(), max)
+	}
+	return nil
+}
+
+// query runs a read after checkArgs.
+func (s *Store) query(ctx context.Context, stmt string, vals []any) (*sql.Rows, error) {
+	if err := s.checkArgs(vals); err != nil {
+		return nil, err
+	}
+	return s.q.QueryContext(ctx, stmt, vals...)
 }
 
 // where renders a checked condition. qual qualifies column names (for the
@@ -472,6 +503,9 @@ func (s *Store) where(t ablage.Table, c ablage.Cond, p *args, qual string) strin
 		list := c.Value.([]any)
 		if len(list) == 0 {
 			return "1=0"
+		}
+		if len(list) >= longList {
+			return s.d.inList(col(c.Field), f.Type, p.addRaw(s.d.encodeList(f.Type, list)))
 		}
 		phs := make([]string, len(list))
 		for i, v := range list {
@@ -618,7 +652,7 @@ func (s *Store) Find(ctx context.Context, table string, q ablage.Query) ([]ablag
 	if q.Offset > 0 {
 		fmt.Fprintf(&b, " OFFSET %d", q.Offset)
 	}
-	rows, err := s.q.QueryContext(ctx, b.String(), p.vals...)
+	rows, err := s.query(ctx, b.String(), p.vals)
 	if err != nil {
 		return nil, err
 	}
@@ -659,7 +693,7 @@ func (s *Store) Count(ctx context.Context, table string, where ablage.Cond) (int
 	}
 	p := &args{d: s.d}
 	stmt := "SELECT COUNT(*) FROM " + s.tableName(t.Name) + " WHERE " + s.where(t, where, p, "")
-	rows, err := s.q.QueryContext(ctx, stmt, p.vals...)
+	rows, err := s.query(ctx, stmt, p.vals)
 	if err != nil {
 		return 0, err
 	}
@@ -722,7 +756,7 @@ func (s *Store) Delete(ctx context.Context, table string, where ablage.Cond) (in
 	cond := s.where(t, where, p, "")
 	var n int64 = -1
 	if _, ok := s.d.(sqliteDialect); ok && selfCascade(t) {
-		rows, err := s.q.QueryContext(ctx, "SELECT COUNT(*) FROM "+s.tableName(t.Name)+" WHERE "+cond, p.vals...)
+		rows, err := s.query(ctx, "SELECT COUNT(*) FROM "+s.tableName(t.Name)+" WHERE "+cond, p.vals)
 		if err != nil {
 			return 0, err
 		}

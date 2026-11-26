@@ -3,9 +3,12 @@ package sqlstore
 import (
 	"context"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
+	"strconv"
 	"strings"
 	"time"
 
@@ -51,6 +54,12 @@ type dialect interface {
 	ordered(col string, t ablage.Type) string
 	encode(t ablage.Type, v any) any
 	decode(t ablage.Type, v any) (any, error)
+	// maxParams is the most parameters one statement may have.
+	maxParams() int
+	// inList renders col IN list for a long list passed as the one
+	// parameter ph, made by encodeList from canonical values of type t.
+	inList(col string, t ablage.Type, ph string) string
+	encodeList(t ablage.Type, vals []any) any
 	columnsQuery() string // one argument: the table name
 	indexesQuery() string // one argument: the table name
 	// plainIndexes lists the indexes of a table that Migrate may replace
@@ -83,6 +92,63 @@ func (sqliteDialect) selectExpr(col string, _ ablage.Type) string { return col }
 // ordered: TEXT columns ablage creates compare by bytes (BINARY), and so do
 // columns created without a collation, as older tables usually are.
 func (sqliteDialect) ordered(col string, _ ablage.Type) string { return col }
+
+// maxParams is SQLITE_MAX_VARIABLE_NUMBER as compiled into modernc.org/sqlite
+// and mattn/go-sqlite3 (the default since SQLite 3.32).
+func (sqliteDialect) maxParams() int { return 32766 }
+
+// inList reads the list from a JSON array with json_each; bytes travel as
+// hex (unhex needs SQLite 3.41).
+func (sqliteDialect) inList(col string, t ablage.Type, ph string) string {
+	if t == ablage.Bytes {
+		return col + " IN (SELECT unhex(value) FROM json_each(" + ph + "))"
+	}
+	return col + " IN (SELECT value FROM json_each(" + ph + "))"
+}
+
+// encodeList writes the values as a JSON array, each as SQLite stores it:
+// bools as 0/1, times as microseconds, bytes as hex. Infinity, which JSON
+// lacks, is written as a number too large for a float, which SQLite reads as
+// infinity.
+func (sqliteDialect) encodeList(t ablage.Type, vals []any) any {
+	var b strings.Builder
+	b.WriteByte('[')
+	for i, v := range vals {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		switch x := v.(type) {
+		case string:
+			j, _ := json.Marshal(x) // valid UTF-8: CheckCond made sure
+			b.Write(j)
+		case int64:
+			b.WriteString(strconv.FormatInt(x, 10))
+		case float64:
+			switch {
+			case math.IsInf(x, 1):
+				b.WriteString("9e999")
+			case math.IsInf(x, -1):
+				b.WriteString("-9e999")
+			default:
+				b.WriteString(strconv.FormatFloat(x, 'g', -1, 64))
+			}
+		case bool:
+			if x {
+				b.WriteByte('1')
+			} else {
+				b.WriteByte('0')
+			}
+		case time.Time:
+			b.WriteString(strconv.FormatInt(x.UnixMicro(), 10))
+		case []byte:
+			b.WriteString(`"` + hex.EncodeToString(x) + `"`)
+		default:
+			panic(fmt.Sprintf("sqlstore: %T in a list", v))
+		}
+	}
+	b.WriteByte(']')
+	return b.String()
+}
 
 func (sqliteDialect) columnType(t ablage.Type) string {
 	switch t {
@@ -243,6 +309,61 @@ func (postgresDialect) ordered(col string, t ablage.Type) string {
 		return col + ` COLLATE "C"`
 	}
 	return col
+}
+
+// maxParams is the limit of the Postgres protocol (a 16-bit count).
+func (postgresDialect) maxParams() int { return 65535 }
+
+// inList compares with an array, passed as text in array syntax so that it
+// works with every driver.
+func (d postgresDialect) inList(col string, t ablage.Type, ph string) string {
+	typ := d.columnType(t)
+	if t == ablage.String {
+		typ = "TEXT"
+	}
+	return col + " = ANY(" + ph + "::" + typ + "[])"
+}
+
+var arrayEscape = strings.NewReplacer(`\`, `\\`, `"`, `\"`)
+
+func (postgresDialect) encodeList(t ablage.Type, vals []any) any {
+	var b strings.Builder
+	b.WriteByte('{')
+	for i, v := range vals {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		var s string
+		switch x := v.(type) {
+		case string:
+			s = x
+		case int64:
+			s = strconv.FormatInt(x, 10)
+		case float64:
+			switch {
+			case math.IsInf(x, 1):
+				s = "Infinity"
+			case math.IsInf(x, -1):
+				s = "-Infinity"
+			default:
+				s = strconv.FormatFloat(x, 'g', -1, 64)
+			}
+		case bool:
+			s = strconv.FormatBool(x)
+		case time.Time:
+			s = x.UTC().Format("2006-01-02 15:04:05.999999") + "+00"
+		case []byte:
+			s = `\x` + hex.EncodeToString(x)
+		default:
+			panic(fmt.Sprintf("sqlstore: %T in a list", v))
+		}
+		// Every element quoted, so no value is read as NULL or splits.
+		b.WriteByte('"')
+		b.WriteString(arrayEscape.Replace(s))
+		b.WriteByte('"')
+	}
+	b.WriteByte('}')
+	return b.String()
 }
 
 func (postgresDialect) columnType(t ablage.Type) string {

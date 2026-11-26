@@ -12,7 +12,7 @@ Building blocks in the root package:
 
 - `Catalog`: declared tables, `Tables()` in reference order, `Referencing(table)`
 - `Table.CheckInsert`, `CheckUpdate`, `CheckCond`, `CheckQuery`: validate and convert values to their canonical types
-- `Cond.Match`, `Compare`, `Query.Less`: the semantics every store must reproduce
+- `Cond.Match`, `Compare`, `Query.Less`: the semantics every store must reproduce. `In` lists can be very long (the suite uses 70,000 values); `CheckCond` hands them over sorted and without duplicates
 - `Row.Clone`, `CloneValue`, `NormalizeTime`
 
 `memstore` is the reference implementation.

@@ -31,7 +31,9 @@ var (
 // storetest, so code tested against one behaves the same on another.
 //
 // Values in rows and conditions are converted to the canonical type of
-// their field (see Type and Field.Value).
+// their field (see Type and Field.Value). Conditions are evaluated as
+// Cond.Match does; an In list may hold any number of values (tens of
+// thousands), in every operation.
 type Store interface {
 	// Declare adds tables to the store; see Catalog.Declare. Usually called
 	// by NewRepository. Declare all tables, then Migrate.

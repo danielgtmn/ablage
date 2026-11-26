@@ -3,6 +3,7 @@ package ablage
 import (
 	"fmt"
 	"reflect"
+	"slices"
 	"strings"
 )
 
@@ -18,7 +19,7 @@ const (
 	OpLte              // Field <= Value
 	OpGt               // Field > Value
 	OpGte              // Field >= Value
-	OpIn               // Field is one of Value ([]any); an empty list matches nothing
+	OpIn               // Field is one of Value ([]any); an empty list matches nothing, any length works
 	OpPrefix           // the String Field starts with Value
 	OpNull             // Field is NULL
 	OpAnd              // all of Conds; none matches every row
@@ -62,7 +63,10 @@ func Lte(field string, v any) Cond { return Cond{Op: OpLte, Field: field, Value:
 func Gt(field string, v any) Cond  { return Cond{Op: OpGt, Field: field, Value: v} }
 func Gte(field string, v any) Cond { return Cond{Op: OpGte, Field: field, Value: v} }
 
-// In matches rows where field is one of vs.
+// In matches rows where field is one of vs. The list may be long (tens of
+// thousands of ids, e.g. to load the rows a page of other rows refers to):
+// the SQL stores pass long lists as a single parameter, so no database
+// limit on parameters applies.
 func In[V any](field string, vs ...V) Cond {
 	list := make([]any, len(vs))
 	for i, v := range vs {
@@ -138,7 +142,8 @@ func (c Cond) Fields() []string {
 }
 
 // CheckCond validates a condition against the table and returns a copy with
-// every value converted to the canonical type of its field.
+// every value converted to the canonical type of its field. The values of
+// In come back sorted (Compare) and without duplicates.
 func (t Table) CheckCond(c Cond) (Cond, error) {
 	switch c.Op {
 	case OpAll:
@@ -196,7 +201,11 @@ func (t Table) CheckCond(c Cond) (Cond, error) {
 			}
 			vals = append(vals, v)
 		}
-		out.Value = vals
+		// Sorted and without duplicates: In is about membership, so this
+		// changes nothing for the result, keeps statements small and lets
+		// Match search instead of scan.
+		slices.SortFunc(vals, Compare)
+		out.Value = slices.CompactFunc(vals, func(a, b any) bool { return Compare(a, b) == 0 })
 	case OpPrefix:
 		if f.Type != String {
 			return c, fmt.Errorf("ablage: Prefix on the %s field %s.%s", f.Type, t.Name, c.Field)
@@ -259,12 +268,8 @@ func (c Cond) Match(row Row) bool {
 	case OpGte:
 		return Compare(v, c.Value) >= 0
 	case OpIn:
-		for _, x := range c.Value.([]any) {
-			if Compare(v, x) == 0 {
-				return true
-			}
-		}
-		return false
+		_, found := slices.BinarySearchFunc(c.Value.([]any), v, Compare)
+		return found
 	case OpPrefix:
 		return strings.HasPrefix(v.(string), c.Value.(string))
 	}
