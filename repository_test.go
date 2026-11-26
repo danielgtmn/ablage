@@ -703,3 +703,56 @@ func TestAggregateUnsupported(t *testing.T) {
 	_, err = r.Aggregate(context.Background(), ablage.Aggregation{Values: []ablage.Agg{ablage.CountAll("n")}})
 	expectErr(t, err, ablage.ErrUnsupported)
 }
+
+func TestUpsertOn(t *testing.T) {
+	forEach(t, func(t *testing.T, s ablage.Store) {
+		r := customers(t, s, ablage.WithUniqueIndex("tenant_id", "name"))
+		first := Customer{TenantID: "t1", Email: "a@x", Name: "n"}
+		must(t, r.Create(t1, &first))
+		// Same tenant and name: the existing entity is overwritten and keeps
+		// its id and created time.
+		e := Customer{TenantID: "t1", Email: "b@x", Name: "n", Credit: 5}
+		must(t, r.UpsertOn(t1, &e, "name", "tenant_id"))
+		if e.ID != first.ID || e.Version != 2 || e.Credit != 5 || e.Email != "b@x" || !e.CreatedAt.Equal(first.CreatedAt) {
+			t.Errorf("after upsert: %+v", e)
+		}
+		if n, _ := r.Count(t1, ablage.All); n != 1 {
+			t.Errorf("%d entities, want 1", n)
+		}
+		// Another name: a new entity.
+		other := Customer{TenantID: "t1", Email: "c@x", Name: "m"}
+		must(t, r.UpsertOn(t1, &other, "tenant_id", "name"))
+		if other.ID == first.ID || other.Version != 1 {
+			t.Errorf("new entity: %+v", other.Base)
+		}
+		// A deleted entity does not count.
+		must(t, r.Delete(t1, first.ID))
+		again := Customer{TenantID: "t1", Email: "d@x", Name: "n"}
+		must(t, r.UpsertOn(t1, &again, "tenant_id", "name"))
+		if again.ID == first.ID || again.Version != 1 {
+			t.Errorf("upsert next to a deleted entity: %+v", again.Base)
+		}
+		if old, _ := r.WithDeleted().Get(t1, first.ID); old.DeletedAt == nil || old.Email != "b@x" {
+			t.Errorf("deleted entity changed: %+v", old)
+		}
+		// The e-mail is unique across tenants: another tenant's entity is
+		// out of scope and stays as it is.
+		foreign := Customer{TenantID: "t2", Email: "z@x", Name: "f"}
+		must(t, r.Create(t2, &foreign))
+		expectErr(t, r.UpsertOn(t1, &Customer{TenantID: "t1", Email: "z@x", Name: "x"}, "email"), ablage.ErrOutOfScope)
+		if got, _ := r.Get(t2, foreign.ID); got.Name != "f" || got.Version != 1 {
+			t.Errorf("t1 changed t2's entity: %+v", got)
+		}
+		expectErr(t, r.UpsertOn(t1, &Customer{TenantID: "t2", Email: "y@x"}, "email"), ablage.ErrOutOfScope)
+		if err := r.UpsertOn(t1, &Customer{TenantID: "t1", Email: "q@x"}, "name"); err == nil {
+			t.Error("upsert on a field without a unique index accepted")
+		}
+	})
+}
+
+func TestUpsertOnUnsupported(t *testing.T) {
+	r, err := ablage.NewRepository[Customer](plainStore{ablagememory()}, "customers")
+	must(t, err)
+	must(t, r.Store().Migrate(context.Background()))
+	expectErr(t, r.UpsertOn(context.Background(), &Customer{Email: "a@x"}, "email"), ablage.ErrUnsupported)
+}

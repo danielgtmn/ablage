@@ -46,6 +46,7 @@ Tag options after the name, e.g. `db:"mail,unique"` or `db:",version"`:
 | `Patch(ctx, id, ablage.Row{"name": "x"})` | sets single columns without reading; values as in the struct, `ablage.Incr(n)` adds `n` to an integer field in one atomic step. Not for the id, managed fields or scope fields. Increments the version, sets updated |
 | `UpdateWhere(ctx, cond, ablage.Row{...})` | `Patch` for every entity matching `cond` (in scope, not soft-deleted unless `WithDeleted`); returns how many it changed |
 | `Upsert(ctx, &e)` | creates, or overwrites without a version check (last write wins); also restores a soft-deleted entity |
+| `UpsertOn(ctx, &e, fields...)` | `Upsert` on a unique index instead of the id, e.g. `UpsertOn(ctx, &m, "tenant_id", "email")`: overwrites the live entity with the same values, which keeps its id (and `e` gets it), or creates one. Deleted entities and NULL values never match |
 | `Delete(ctx, id)`, `DeleteWhere(ctx, cond)` | soft delete if there is a `deleted` field, else removal |
 | `Restore(ctx, id)` | undoes a soft delete |
 | `Purge(ctx, id)` | removes for good, also soft-deleted entities |

@@ -32,6 +32,8 @@ Values every store keeps the same way, and nothing else (the others are refused 
 
 `Unique` and `Index` on a field, or `Indexes` over several. Unique means unique among rows where none of the fields is NULL. On a table with soft delete, only rows that are not deleted count, so a deleted entity does not block its name.
 
+A unique index can serve as the key of an upsert: `Repository.UpsertOn(ctx, &e, "project_id", "title")` (or `ablage.UpsertOn` on a store) updates the live row with these values instead of failing with `ErrDuplicate`.
+
 Uniqueness is checked row by row, as SQL databases do: an update that shifts unique values of several rows (`pos = pos + 1`) can fail on the way even if the end result would be unique. Do such shifts in two steps.
 
 ## References

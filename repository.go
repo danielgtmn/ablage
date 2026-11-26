@@ -564,6 +564,27 @@ func (r *Repository[T]) purge(ctx context.Context, where Cond) (int64, error) {
 // restoring it if soft-deleted. ErrOutOfScope if the existing entity lies
 // outside the scope. e is updated with the stored version and times.
 func (r *Repository[T]) Upsert(ctx context.Context, e *T) error {
+	return r.upsert(ctx, e, nil)
+}
+
+// UpsertOn is Upsert on a unique index instead of the id: it creates the
+// entity or, if a live one with the same values in fields exists (fields of
+// a unique index, declared with WithUniqueIndex or the unique tag, in any
+// order), overwrites that one, which keeps its id, created time and version
+// count. e then holds the stored entity, including that id. A soft-deleted
+// entity with the values does not count (the index covers live entities
+// only), and NULL in one of the fields never matches. ErrOutOfScope if the
+// existing entity lies outside the scope; ErrUnsupported if the store is
+// not an UniqueUpserter.
+func (r *Repository[T]) UpsertOn(ctx context.Context, e *T, fields ...string) error {
+	if _, err := r.table.CheckConflict(fields); err != nil {
+		return err
+	}
+	return r.upsert(ctx, e, fields)
+}
+
+// upsert writes e with the conflict on the fields on, or the id if nil.
+func (r *Repository[T]) upsert(ctx context.Context, e *T, on []string) error {
 	v := reflect.ValueOf(e).Elem()
 	row, err := r.m.row(v)
 	if err != nil {
@@ -601,14 +622,38 @@ func (r *Repository[T]) Upsert(ctx context.Context, e *T) error {
 	if err != nil {
 		return err
 	}
-	ok, err := r.store.Upsert(ctx, r.table.Name, row, update, s)
+	var ok bool
+	if on == nil {
+		ok, err = r.store.Upsert(ctx, r.table.Name, row, update, s)
+	} else {
+		ok, err = UpsertOn(ctx, r.store, r.table.Name, on, row, update, s)
+	}
 	if err != nil {
 		return err
 	}
 	if !ok {
 		return fmt.Errorf("%w: %s %q", ErrOutOfScope, r.table.Name, id)
 	}
-	stored, err := r.Unscoped().WithDeleted().Get(ctx, id)
+	// Read back what was stored: by id, or by the values of the index,
+	// which belong to the one live entity that has them.
+	where := Eq("id", id)
+	if on != nil {
+		conds := []Cond{}
+		for _, f := range on {
+			if row[f] == nil {
+				conds = nil // never conflicts: inserted under id
+				break
+			}
+			conds = append(conds, Eq(f, row[f]))
+		}
+		if conds != nil {
+			if r.m.deleted != nil {
+				conds = append(conds, Null(r.m.deleted.field.Name))
+			}
+			where = And(conds...)
+		}
+	}
+	stored, err := r.Unscoped().WithDeleted().First(ctx, Query{Where: where})
 	if err != nil {
 		return err
 	}
