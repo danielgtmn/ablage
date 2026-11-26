@@ -190,7 +190,8 @@ func (r *Repository[T]) Get(ctx context.Context, id string) (T, error) {
 }
 
 // GetMany returns the entities with the given ids that exist, in no
-// particular order.
+// particular order. Any number of ids works, so related entities of a whole
+// page can be loaded in one call.
 func (r *Repository[T]) GetMany(ctx context.Context, ids ...string) ([]T, error) {
 	return r.Find(ctx, Query{Where: In("id", ids...)})
 }

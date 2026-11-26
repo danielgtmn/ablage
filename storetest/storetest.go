@@ -51,6 +51,8 @@ func Run(t *testing.T, open Opener) {
 		{"UniqueRowByRow", testUniqueRowByRow},
 		{"InvalidValues", testInvalidValues},
 		{"CascadeCount", testCascadeCount},
+		{"LongIn", testLongIn},
+		{"LongInTypes", testLongInTypes},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) { tc.fn(t, open) })
@@ -732,4 +734,98 @@ func testCascadeCount(t *testing.T, open Opener) {
 		t.Errorf("deleted %d, want 3", n)
 	}
 	expectIDs(t, s, "nodes", ablage.Query{}, "d")
+}
+
+// In takes more values than a database takes parameters in one statement,
+// in every operation and nested in other conditions.
+func testLongIn(t *testing.T, open Opener) {
+	s := setup(t, open)
+	must(t, s.Tx(ctx, func(tx ablage.Store) error {
+		for i := range 500 {
+			insert(t, tx, "people", ablage.Row{"id": fmt.Sprintf("p%06d", i), "name": fmt.Sprintf("n%05d", 1000-i), "age": i})
+		}
+		return nil
+	}))
+	// 70,000 ids (more than SQLite and Postgres take parameters), every second one of the rows among them, and duplicates.
+	var list []string
+	for i := range 70000 {
+		list = append(list, fmt.Sprintf("p%06d", 2*i))
+	}
+	list = append(list, list[:1000]...)
+	in := ablage.In("id", list...)
+	count := func(c ablage.Cond, want int64) {
+		t.Helper()
+		n, err := s.Count(ctx, "people", c)
+		must(t, err)
+		if n != want {
+			t.Errorf("count %d, want %d", n, want)
+		}
+	}
+	count(in, 250)
+	count(ablage.Not(in), 250)
+	count(ablage.Or(in, ablage.Eq("id", "p000001")), 251)
+	count(ablage.And(in, ablage.Lt("age", 100)), 50)
+	expectIDs(t, s, "people", ablage.Query{Where: in, OrderBy: []ablage.Order{ablage.Asc("name")}, Limit: 3, Offset: 1},
+		"p000496", "p000494", "p000492")
+	n, err := s.Update(ctx, "people", ablage.Row{"visits": ablage.Incr(1)}, in)
+	must(t, err)
+	if n != 250 {
+		t.Errorf("updated %d, want 250", n)
+	}
+	count(ablage.Eq("visits", 1), 250)
+	ok, err := s.Upsert(ctx, "people", ablage.Row{"id": "p000002", "name": "x"}, ablage.Row{"name": "upserted"}, in)
+	must(t, err)
+	if !ok || get(t, s, "people", "p000002")["name"] != "upserted" {
+		t.Errorf("upsert with a long list in where: ok=%v", ok)
+	}
+	n, err = s.Delete(ctx, "people", ablage.And(in, ablage.Lt("age", 100)))
+	must(t, err)
+	if n != 50 {
+		t.Errorf("deleted %d, want 50", n)
+	}
+	count(ablage.All, 450)
+}
+
+// Long In lists hold values of every type that can be compared, including
+// those that are hard to pass on as text.
+func testLongInTypes(t *testing.T, open Opener) {
+	s := setup(t, open)
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	names := []string{`quote " and \ backslash`, "NULL", "", "{a,b}", "Ünal 🙂", "'; --"}
+	floats := []float64{math.Inf(1), math.Inf(-1), 0.1, -1.5e300, 5e-324, 1 << 62}
+	for i := range 6 {
+		insert(t, s, "people", ablage.Row{
+			"id": fmt.Sprint(i), "name": names[i], "age": int64(-1<<63) + int64(i), "score": floats[i],
+			"born": base.Add(time.Duration(i) * time.Microsecond), "avatar": []byte{0, byte(i), 255},
+		})
+	}
+	insert(t, s, "people", ablage.Row{"id": "null", "name": "other"}) // NULL everywhere it can be
+	pad := func(n int, f func(i int) any) []any {
+		out := make([]any, n)
+		for i := range out {
+			out[i] = f(i)
+		}
+		return out
+	}
+	cases := []struct {
+		name  string
+		field string
+		vals  []any
+	}{
+		{"string", "name", append(pad(500, func(i int) any { return fmt.Sprintf("x%d", i) }), names[0], names[1], names[2], names[3], names[4], names[5])},
+		{"int", "age", append(pad(500, func(i int) any { return i }), int64(-1<<63), int64(-1<<63)+1, int64(-1<<63)+2, int64(-1<<63)+3, int64(-1<<63)+4, int64(-1<<63)+5)},
+		{"float", "score", append(pad(500, func(i int) any { return float64(i) + 0.5 }), floats[0], floats[1], floats[2], floats[3], floats[4], floats[5])},
+		{"time", "born", append(pad(500, func(i int) any { return base.Add(time.Hour * time.Duration(i+1)) }),
+			base, base.Add(1*time.Microsecond), base.Add(2*time.Microsecond), base.Add(3*time.Microsecond), base.Add(4*time.Microsecond), base.Add(5*time.Microsecond))},
+		{"bytes", "avatar", append(pad(500, func(i int) any { return []byte{1, byte(i), byte(i >> 8)} }),
+			[]byte{0, 0, 255}, []byte{0, 1, 255}, []byte{0, 2, 255}, []byte{0, 3, 255}, []byte{0, 4, 255}, []byte{0, 5, 255})},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// All six rows, then without the first one, and the rest.
+			expectIDs(t, s, "people", ablage.Query{Where: ablage.In(tc.field, tc.vals...)}, "0", "1", "2", "3", "4", "5")
+			expectIDs(t, s, "people", ablage.Query{Where: ablage.In(tc.field, tc.vals[:len(tc.vals)-1]...)}, "0", "1", "2", "3", "4")
+			expectIDs(t, s, "people", ablage.Query{Where: ablage.Not(ablage.In(tc.field, tc.vals[:len(tc.vals)-1]...))}, "5", "null")
+		})
+	}
 }

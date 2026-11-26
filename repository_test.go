@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/netip"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -544,4 +545,39 @@ func TestPatchChecksTheGoType(t *testing.T) {
 	if _, err := r.Get(ctx, e.ID); err != nil {
 		t.Errorf("entity unreadable: %v", err)
 	}
+}
+
+// GetMany takes as many ids as an app has, e.g. every row a page of other
+// rows refers to, and still applies scope and soft delete.
+func TestGetManyLong(t *testing.T) {
+	forEach(t, func(t *testing.T, s ablage.Store) {
+		r := customers(t, s)
+		var ids []string
+		must(t, s.Tx(t1, func(tx ablage.Store) error {
+			for i := range 200 {
+				ctx, tenant := t1, "t1"
+				if i%4 == 0 {
+					ctx, tenant = t2, "t2"
+				}
+				c := Customer{TenantID: tenant, Email: strconv.Itoa(i)}
+				must(t, r.With(tx).Create(ctx, &c))
+				ids = append(ids, c.ID)
+			}
+			return nil
+		}))
+		must(t, r.Delete(t1, ids[1]))
+		for i := range 70000 {
+			ids = append(ids, "missing"+strconv.Itoa(i))
+		}
+		got, err := r.GetMany(t1, ids...)
+		must(t, err)
+		if len(got) != 149 {
+			t.Errorf("GetMany: %d, want 149", len(got))
+		}
+		n, err := r.Count(t1, ablage.In("id", ids...))
+		must(t, err)
+		if n != 149 {
+			t.Errorf("Count: %d, want 149", n)
+		}
+	})
 }
