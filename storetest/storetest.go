@@ -51,6 +51,10 @@ func Run(t *testing.T, open Opener) {
 		{"UniqueRowByRow", testUniqueRowByRow},
 		{"InvalidValues", testInvalidValues},
 		{"CascadeCount", testCascadeCount},
+		{"LongIn", testLongIn},
+		{"LongInTypes", testLongInTypes},
+		{"Aggregate", testAggregate},
+		{"UpsertOn", testUpsertOn},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) { tc.fn(t, open) })
@@ -732,4 +736,319 @@ func testCascadeCount(t *testing.T, open Opener) {
 		t.Errorf("deleted %d, want 3", n)
 	}
 	expectIDs(t, s, "nodes", ablage.Query{}, "d")
+}
+
+// In takes more values than a database takes parameters in one statement,
+// in every operation and nested in other conditions.
+func testLongIn(t *testing.T, open Opener) {
+	s := setup(t, open)
+	must(t, s.Tx(ctx, func(tx ablage.Store) error {
+		for i := range 500 {
+			insert(t, tx, "people", ablage.Row{"id": fmt.Sprintf("p%06d", i), "name": fmt.Sprintf("n%05d", 1000-i), "age": i})
+		}
+		return nil
+	}))
+	// 70,000 ids (more than SQLite and Postgres take parameters), every second one of the rows among them, and duplicates.
+	var list []string
+	for i := range 70000 {
+		list = append(list, fmt.Sprintf("p%06d", 2*i))
+	}
+	list = append(list, list[:1000]...)
+	in := ablage.In("id", list...)
+	count := func(c ablage.Cond, want int64) {
+		t.Helper()
+		n, err := s.Count(ctx, "people", c)
+		must(t, err)
+		if n != want {
+			t.Errorf("count %d, want %d", n, want)
+		}
+	}
+	count(in, 250)
+	count(ablage.Not(in), 250)
+	count(ablage.Or(in, ablage.Eq("id", "p000001")), 251)
+	count(ablage.And(in, ablage.Lt("age", 100)), 50)
+	expectIDs(t, s, "people", ablage.Query{Where: in, OrderBy: []ablage.Order{ablage.Asc("name")}, Limit: 3, Offset: 1},
+		"p000496", "p000494", "p000492")
+	n, err := s.Update(ctx, "people", ablage.Row{"visits": ablage.Incr(1)}, in)
+	must(t, err)
+	if n != 250 {
+		t.Errorf("updated %d, want 250", n)
+	}
+	count(ablage.Eq("visits", 1), 250)
+	ok, err := s.Upsert(ctx, "people", ablage.Row{"id": "p000002", "name": "x"}, ablage.Row{"name": "upserted"}, in)
+	must(t, err)
+	if !ok || get(t, s, "people", "p000002")["name"] != "upserted" {
+		t.Errorf("upsert with a long list in where: ok=%v", ok)
+	}
+	n, err = s.Delete(ctx, "people", ablage.And(in, ablage.Lt("age", 100)))
+	must(t, err)
+	if n != 50 {
+		t.Errorf("deleted %d, want 50", n)
+	}
+	count(ablage.All, 450)
+}
+
+// Long In lists hold values of every type that can be compared, including
+// those that are hard to pass on as text.
+func testLongInTypes(t *testing.T, open Opener) {
+	s := setup(t, open)
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	names := []string{`quote " and \ backslash`, "NULL", "", "{a,b}", "Ünal 🙂", "'; --"}
+	floats := []float64{math.Inf(1), math.Inf(-1), 0.1, -1.5e300, 5e-324, 1 << 62}
+	for i := range 6 {
+		insert(t, s, "people", ablage.Row{
+			"id": fmt.Sprint(i), "name": names[i], "age": int64(-1<<63) + int64(i), "score": floats[i],
+			"born": base.Add(time.Duration(i) * time.Microsecond), "avatar": []byte{0, byte(i), 255},
+		})
+	}
+	insert(t, s, "people", ablage.Row{"id": "null", "name": "other"}) // NULL everywhere it can be
+	pad := func(n int, f func(i int) any) []any {
+		out := make([]any, n)
+		for i := range out {
+			out[i] = f(i)
+		}
+		return out
+	}
+	cases := []struct {
+		name  string
+		field string
+		vals  []any
+	}{
+		{"string", "name", append(pad(500, func(i int) any { return fmt.Sprintf("x%d", i) }), names[0], names[1], names[2], names[3], names[4], names[5])},
+		{"int", "age", append(pad(500, func(i int) any { return i }), int64(-1<<63), int64(-1<<63)+1, int64(-1<<63)+2, int64(-1<<63)+3, int64(-1<<63)+4, int64(-1<<63)+5)},
+		{"float", "score", append(pad(500, func(i int) any { return float64(i) + 0.5 }), floats[0], floats[1], floats[2], floats[3], floats[4], floats[5])},
+		{"time", "born", append(pad(500, func(i int) any { return base.Add(time.Hour * time.Duration(i+1)) }),
+			base, base.Add(1*time.Microsecond), base.Add(2*time.Microsecond), base.Add(3*time.Microsecond), base.Add(4*time.Microsecond), base.Add(5*time.Microsecond))},
+		{"bytes", "avatar", append(pad(500, func(i int) any { return []byte{1, byte(i), byte(i >> 8)} }),
+			[]byte{0, 0, 255}, []byte{0, 1, 255}, []byte{0, 2, 255}, []byte{0, 3, 255}, []byte{0, 4, 255}, []byte{0, 5, 255})},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// All six rows, then without the first one, and the rest.
+			expectIDs(t, s, "people", ablage.Query{Where: ablage.In(tc.field, tc.vals...)}, "0", "1", "2", "3", "4", "5")
+			expectIDs(t, s, "people", ablage.Query{Where: ablage.In(tc.field, tc.vals[:len(tc.vals)-1]...)}, "0", "1", "2", "3", "4")
+			expectIDs(t, s, "people", ablage.Query{Where: ablage.Not(ablage.In(tc.field, tc.vals[:len(tc.vals)-1]...))}, "5", "null")
+		})
+	}
+}
+
+// Aggregations follow Aggregation.Apply: NULLs ignored, sums of nothing 0,
+// minimum and maximum of nothing NULL, groups sorted by their keys.
+func testAggregate(t *testing.T, open Opener) {
+	s := setup(t, open)
+	ag, ok := s.(ablage.Aggregator)
+	if !ok {
+		t.Skip("the store is not an ablage.Aggregator")
+	}
+	seedPeople(t, s)
+	born := time.Date(1906, 12, 9, 0, 0, 0, 0, time.UTC)
+	_, err := s.Update(ctx, "people", ablage.Row{"born": born, "visits": 7}, ablage.Eq("id", "3"))
+	must(t, err)
+	_, err = s.Update(ctx, "people", ablage.Row{"born": born.AddDate(10, 0, 0), "visits": -2}, ablage.Eq("id", "4"))
+	must(t, err)
+	all := []ablage.Agg{
+		ablage.CountAll("n"), ablage.Count("age", "aged"), ablage.Sum("age", "ages"), ablage.Sum("visits", "visits"),
+		ablage.Min("age", "youngest"), ablage.Max("age", "oldest"), ablage.Min("name", "first"), ablage.Max("name", "last"),
+		ablage.Min("score", "low"), ablage.Max("score", "high"), ablage.Min("born", "born_first"), ablage.Max("born", "born_last"),
+	}
+	cases := []struct {
+		name string
+		a    ablage.Aggregation
+		want []ablage.Row
+	}{
+		{"all rows", ablage.Aggregation{Values: all}, []ablage.Row{{
+			"n": int64(5), "aged": int64(4), "ages": int64(198), "visits": int64(5), "youngest": int64(36), "oldest": int64(85),
+			"first": "Ada", "last": "Ünal", "low": -2.0, "high": 1.5, "born_first": born, "born_last": born.AddDate(10, 0, 0),
+		}}},
+		{"no rows", ablage.Aggregation{Where: ablage.Eq("id", "nope"), Values: all}, []ablage.Row{{
+			"n": int64(0), "aged": int64(0), "ages": int64(0), "visits": int64(0), "youngest": nil, "oldest": nil,
+			"first": nil, "last": nil, "low": nil, "high": nil, "born_first": nil, "born_last": nil,
+		}}},
+		{"only NULLs", ablage.Aggregation{Where: ablage.Eq("id", "4"), Values: []ablage.Agg{ablage.Count("age", "c"), ablage.Sum("age", "s"), ablage.Max("age", "m")}},
+			[]ablage.Row{{"c": int64(0), "s": int64(0), "m": nil}}},
+		{"group by bool", ablage.Aggregation{GroupBy: []string{"active"}, Values: []ablage.Agg{ablage.CountAll("n"), ablage.Sum("age", "ages")}},
+			[]ablage.Row{{"active": false, "n": int64(2), "ages": int64(41)}, {"active": true, "n": int64(3), "ages": int64(157)}}},
+		{"group by with NULL first", ablage.Aggregation{GroupBy: []string{"age"}, Values: []ablage.Agg{ablage.CountAll("n"), ablage.Max("name", "name")}},
+			[]ablage.Row{
+				{"age": nil, "n": int64(1), "name": "grace"}, {"age": int64(36), "n": int64(2), "name": "Ünal"},
+				{"age": int64(41), "n": int64(1), "name": "Alan"}, {"age": int64(85), "n": int64(1), "name": "Grace"},
+			}},
+		{"group by two fields, with where", ablage.Aggregation{Where: ablage.Ne("id", "2"), GroupBy: []string{"active", "email"}, Values: []ablage.Agg{ablage.CountAll("n")}},
+			[]ablage.Row{
+				{"active": false, "email": nil, "n": int64(1)}, {"active": true, "email": nil, "n": int64(1)},
+				{"active": true, "email": "ada@x", "n": int64(1)}, {"active": true, "email": "u@x", "n": int64(1)},
+			}},
+		{"group by strings in byte order", ablage.Aggregation{GroupBy: []string{"name"}},
+			[]ablage.Row{{"name": "Ada"}, {"name": "Alan"}, {"name": "Grace"}, {"name": "grace"}, {"name": "Ünal"}}},
+		{"groups of no rows", ablage.Aggregation{Where: ablage.Eq("id", "nope"), GroupBy: []string{"age"}, Values: all}, []ablage.Row{}},
+		{"long list in where", ablage.Aggregation{Where: ablage.In("id", append(pad(1000), "1", "5")...), GroupBy: []string{"age"}, Values: []ablage.Agg{ablage.CountAll("n")}},
+			[]ablage.Row{{"age": int64(36), "n": int64(2)}}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := ag.Aggregate(ctx, "people", tc.a)
+			must(t, err)
+			if got == nil || fmt.Sprint(got) != fmt.Sprint(tc.want) {
+				t.Errorf("got  %v\nwant %v", got, tc.want)
+			}
+			// The package function does the same on any store.
+			again, err := ablage.Aggregate(ctx, s, "people", tc.a)
+			must(t, err)
+			if fmt.Sprint(again) != fmt.Sprint(got) {
+				t.Errorf("ablage.Aggregate: %v", again)
+			}
+		})
+	}
+	bad := []ablage.Aggregation{
+		{},
+		{Values: []ablage.Agg{ablage.Sum("name", "x")}},
+		{Values: []ablage.Agg{ablage.Sum("score", "x")}},
+		{Values: []ablage.Agg{ablage.Min("active", "x")}},
+		{Values: []ablage.Agg{ablage.Max("avatar", "x")}},
+		{Values: []ablage.Agg{ablage.Max("tags", "x")}},
+		{Values: []ablage.Agg{ablage.Count("nope", "x")}},
+		{Values: []ablage.Agg{ablage.CountAll("Bad-Name")}},
+		{Values: []ablage.Agg{ablage.CountAll("")}},
+		{Values: []ablage.Agg{ablage.CountAll("x"), ablage.Count("age", "x")}},
+		{GroupBy: []string{"age"}, Values: []ablage.Agg{ablage.CountAll("age")}},
+		{GroupBy: []string{"tags"}},
+		{GroupBy: []string{"age", "age"}},
+		{GroupBy: []string{"nope"}},
+		{Values: []ablage.Agg{{Op: 0, As: "x"}}},
+		{Where: ablage.Eq("nope", 1), Values: []ablage.Agg{ablage.CountAll("n")}},
+	}
+	for _, a := range bad {
+		if _, err := ag.Aggregate(ctx, "people", a); err == nil {
+			t.Errorf("invalid aggregation %+v accepted", a)
+		}
+	}
+	// A sum fits if the total fits, whatever the order of adding up; one
+	// that does not fit into an int64 fails.
+	insert(t, s, "people", ablage.Row{"id": "big1", "name": "big", "visits": int64(math.MaxInt64)})
+	insert(t, s, "people", ablage.Row{"id": "big2", "name": "big", "visits": int64(math.MaxInt64) - 5})
+	insert(t, s, "people", ablage.Row{"id": "big3", "name": "big", "visits": int64(math.MinInt64)})
+	got, err := ag.Aggregate(ctx, "people", ablage.Aggregation{Values: []ablage.Agg{ablage.Sum("visits", "v")}})
+	must(t, err)
+	if want := int64(math.MaxInt64) - 1; got[0]["v"] != want {
+		t.Errorf("sum %v, want %d", got[0]["v"], want)
+	}
+	must(t, s.Insert(ctx, "people", ablage.Row{"id": "big4", "name": "big", "visits": 2}))
+	if _, err := ag.Aggregate(ctx, "people", ablage.Aggregation{Values: []ablage.Agg{ablage.Sum("visits", "v")}}); err == nil {
+		t.Error("overflowing sum accepted")
+	}
+}
+
+func pad(n int) []string {
+	out := make([]string, n)
+	for i := range out {
+		out[i] = fmt.Sprintf("pad%d", i)
+	}
+	return out
+}
+
+// UpsertOn conflicts on a unique index: same values, none NULL, live rows
+// only with soft delete; the existing row keeps its id.
+func testUpsertOn(t *testing.T, open Opener) {
+	members := ablage.Table{Name: "members", Fields: []ablage.Field{
+		{Name: "tenant", Type: ablage.String},
+		{Name: "email", Type: ablage.String, Nullable: true},
+		{Name: "code", Type: ablage.String, Nullable: true, Unique: true},
+		{Name: "name", Type: ablage.String},
+		{Name: "visits", Type: ablage.Int},
+		{Name: "deleted_at", Type: ablage.Time, Nullable: true},
+	}, Indexes: []ablage.Index{{Fields: []string{"tenant", "email"}, Unique: true}}, SoftDelete: "deleted_at"}
+	s := setup(t, open, members, people)
+	u, ok := s.(ablage.UniqueUpserter)
+	if !ok {
+		t.Skip("the store is not an ablage.UniqueUpserter")
+	}
+	on := []string{"email", "tenant"} // any order
+	up := func(row, update ablage.Row, where ablage.Cond) bool {
+		t.Helper()
+		ok, err := u.UpsertOn(ctx, "members", on, row, update, where)
+		must(t, err)
+		return ok
+	}
+	expect := func(id string, want string) {
+		t.Helper()
+		r := get(t, s, "members", id)
+		if got := fmt.Sprintf("%v %v %v", r["name"], r["visits"], r["deleted_at"] != nil); got != want {
+			t.Errorf("%s: %s, want %s", id, got, want)
+		}
+	}
+	bump := ablage.Row{"name": "again", "visits": ablage.Incr(1)}
+	if !up(ablage.Row{"id": "a", "tenant": "t1", "email": "x", "name": "first"}, bump, ablage.All) {
+		t.Error("insert reports false")
+	}
+	expect("a", "first 0 false")
+	// The same values under another id update the existing row.
+	if !up(ablage.Row{"id": "b", "tenant": "t1", "email": "x", "name": "second"}, bump, ablage.All) {
+		t.Error("update reports false")
+	}
+	expect("a", "again 1 false")
+	expectIDs(t, s, "members", ablage.Query{}, "a")
+	// Not matching where: nothing changes.
+	if up(ablage.Row{"id": "b", "tenant": "t1", "email": "x"}, bump, ablage.Eq("name", "nope")) {
+		t.Error("upsert not matching where reports true")
+	}
+	if !up(ablage.Row{"id": "b", "tenant": "t1", "email": "x"}, ablage.Row{}, ablage.Eq("name", "again")) {
+		t.Error("empty update of a matching row reports false")
+	}
+	expect("a", "again 1 false")
+	// Other values, and NULL, do not conflict.
+	up(ablage.Row{"id": "c", "tenant": "t2", "email": "x", "name": "c"}, bump, ablage.All)
+	up(ablage.Row{"id": "d", "tenant": "t1", "name": "d"}, bump, ablage.All)
+	up(ablage.Row{"id": "e", "tenant": "t1", "name": "e"}, bump, ablage.All)
+	expectIDs(t, s, "members", ablage.Query{}, "a", "c", "d", "e")
+	// A deleted row does not conflict, nor does a deleted row being written.
+	_, err := s.Update(ctx, "members", ablage.Row{"deleted_at": time.Now()}, ablage.Eq("id", "a"))
+	must(t, err)
+	up(ablage.Row{"id": "f", "tenant": "t1", "email": "x", "name": "f"}, bump, ablage.All)
+	up(ablage.Row{"id": "g", "tenant": "t1", "email": "x", "name": "g", "deleted_at": time.Now()}, bump, ablage.All)
+	expect("a", "again 1 true")
+	expect("f", "f 0 false")
+	expect("g", "g 0 true")
+	// The conflict on the index wins over the id: the row with the values
+	// is updated, not the one with the id.
+	up(ablage.Row{"id": "c", "tenant": "t1", "email": "x"}, bump, ablage.All)
+	expect("f", "again 1 false")
+	expect("c", "c 0 false")
+	// Other unique values and a taken id fail as in Insert.
+	up(ablage.Row{"id": "h", "tenant": "t3", "email": "y", "code": "k"}, bump, ablage.All)
+	for _, row := range []ablage.Row{
+		{"id": "i", "tenant": "t3", "email": "z", "code": "k"},
+		{"id": "c", "tenant": "t3", "email": "z"},
+	} {
+		if _, err := u.UpsertOn(ctx, "members", on, row, bump, ablage.All); !errors.Is(err, ablage.ErrDuplicate) {
+			t.Errorf("upsert of %v: %v, want ErrDuplicate", row, err)
+		}
+	}
+	if _, err := u.UpsertOn(ctx, "members", on, ablage.Row{"id": "a", "tenant": "t1", "email": "x"}, ablage.Row{"code": "k"}, ablage.All); !errors.Is(err, ablage.ErrDuplicate) {
+		t.Errorf("update to a taken value: %v", err)
+	}
+	// A single unique field; the id, as Upsert.
+	ok, err = u.UpsertOn(ctx, "members", []string{"code"}, ablage.Row{"id": "j", "tenant": "t9", "code": "k"}, ablage.Row{"name": "by code"}, ablage.All)
+	must(t, err)
+	if !ok {
+		t.Error("upsert on code reports false")
+	}
+	expect("h", "by code 0 false")
+	ok, err = ablage.UpsertOn(ctx, s, "members", []string{"id"}, ablage.Row{"id": "h", "tenant": "x"}, ablage.Row{"name": "by id"}, ablage.All)
+	must(t, err)
+	if !ok {
+		t.Error("upsert on id reports false")
+	}
+	expect("h", "by id 0 false")
+	// Without soft delete.
+	insert(t, s, "people", ablage.Row{"id": "1", "name": "Ada", "email": "ada@x"})
+	_, err = ablage.UpsertOn(ctx, s, "people", []string{"email"}, ablage.Row{"id": "2", "name": "x", "email": "ada@x"}, ablage.Row{"visits": ablage.Incr(5)}, ablage.All)
+	must(t, err)
+	if r := get(t, s, "people", "1"); r["visits"] != int64(5) || r["name"] != "Ada" {
+		t.Errorf("people: %v", r)
+	}
+	for _, bad := range [][]string{nil, {"name"}, {"tenant"}, {"tenant", "email", "name"}, {"nope"}} {
+		if _, err := u.UpsertOn(ctx, "members", bad, ablage.Row{"id": "z", "tenant": "t"}, bump, ablage.All); err == nil {
+			t.Errorf("conflict target %v accepted", bad)
+		}
+	}
 }

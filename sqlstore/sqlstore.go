@@ -10,6 +10,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math/big"
 	"regexp"
 	"slices"
 	"strings"
@@ -381,6 +382,9 @@ func (s *Store) Tx(ctx context.Context, fn func(ablage.Store) error) error {
 // a failed statement (e.g. a duplicate) leaves the transaction usable, as
 // it does in SQLite and memory.
 func (s *Store) exec(ctx context.Context, stmt string, vals []any) (sql.Result, error) {
+	if err := s.checkArgs(vals); err != nil {
+		return nil, err
+	}
 	if _, pg := s.d.(postgresDialect); !pg || !s.inTx {
 		res, err := s.q.ExecContext(ctx, stmt, vals...)
 		return res, s.wrap(err)
@@ -420,8 +424,36 @@ type args struct {
 }
 
 func (p *args) add(t ablage.Type, v any) string {
-	p.vals = append(p.vals, p.d.encode(t, v))
+	return p.addRaw(p.d.encode(t, v))
+}
+
+// addRaw adds a parameter that is already in the form the driver takes.
+func (p *args) addRaw(v any) string {
+	p.vals = append(p.vals, v)
 	return p.d.placeholder(len(p.vals))
+}
+
+// longList is the length from which an In list goes into the statement as
+// one parameter (see dialect.inList) instead of one per value.
+const longList = 100
+
+// checkArgs refuses a statement with more parameters than the database
+// takes, with an error that says so instead of the driver's. Only
+// conditions with thousands of comparisons get there; long In lists take one
+// parameter.
+func (s *Store) checkArgs(vals []any) error {
+	if max := s.d.maxParams(); len(vals) > max {
+		return fmt.Errorf("sqlstore: the statement needs %d parameters, %s takes at most %d (use In for long lists of values)", len(vals), s.d.name(), max)
+	}
+	return nil
+}
+
+// query runs a read after checkArgs.
+func (s *Store) query(ctx context.Context, stmt string, vals []any) (*sql.Rows, error) {
+	if err := s.checkArgs(vals); err != nil {
+		return nil, err
+	}
+	return s.q.QueryContext(ctx, stmt, vals...)
 }
 
 // where renders a checked condition. qual qualifies column names (for the
@@ -472,6 +504,9 @@ func (s *Store) where(t ablage.Table, c ablage.Cond, p *args, qual string) strin
 		list := c.Value.([]any)
 		if len(list) == 0 {
 			return "1=0"
+		}
+		if len(list) >= longList {
+			return s.d.inList(col(c.Field), f.Type, p.addRaw(s.d.encodeList(f.Type, list)))
 		}
 		phs := make([]string, len(list))
 		for i, v := range list {
@@ -564,8 +599,18 @@ func (s *Store) set(t ablage.Table, set ablage.Row, p *args, qual string) string
 
 // Upsert implements ablage.Store.
 func (s *Store) Upsert(ctx context.Context, table string, row, update ablage.Row, where ablage.Cond) (bool, error) {
+	return s.UpsertOn(ctx, table, []string{"id"}, row, update, where)
+}
+
+var _ ablage.UniqueUpserter = (*Store)(nil)
+
+// UpsertOn implements ablage.UniqueUpserter.
+func (s *Store) UpsertOn(ctx context.Context, table string, on []string, row, update ablage.Row, where ablage.Cond) (bool, error) {
 	t, err := s.table(table)
 	if err != nil {
+		return false, err
+	}
+	if on, err = t.CheckConflict(on); err != nil {
 		return false, err
 	}
 	if row, err = t.CheckInsert(row); err != nil {
@@ -583,7 +628,17 @@ func (s *Store) Upsert(ctx context.Context, table string, row, update ablage.Row
 	if set == "" {
 		set = quote("id") + " = " + qual + quote("id")
 	}
-	stmt += " ON CONFLICT (" + quote("id") + ") DO UPDATE SET " + set + " WHERE " + s.where(t, where, p, qual)
+	target := make([]string, len(on))
+	for i, f := range on {
+		target[i] = quote(f)
+	}
+	stmt += " ON CONFLICT (" + strings.Join(target, ", ") + ")"
+	if on[0] != "id" && t.SoftDelete != "" {
+		// The index covers live rows only; naming its condition lets the
+		// database find it.
+		stmt += " WHERE " + quote(t.SoftDelete) + " IS NULL"
+	}
+	stmt += " DO UPDATE SET " + set + " WHERE " + s.where(t, where, p, qual)
 	res, err := s.exec(ctx, stmt, p.vals)
 	if err != nil {
 		return false, err
@@ -618,7 +673,7 @@ func (s *Store) Find(ctx context.Context, table string, q ablage.Query) ([]ablag
 	if q.Offset > 0 {
 		fmt.Fprintf(&b, " OFFSET %d", q.Offset)
 	}
-	rows, err := s.q.QueryContext(ctx, b.String(), p.vals...)
+	rows, err := s.query(ctx, b.String(), p.vals)
 	if err != nil {
 		return nil, err
 	}
@@ -659,7 +714,7 @@ func (s *Store) Count(ctx context.Context, table string, where ablage.Cond) (int
 	}
 	p := &args{d: s.d}
 	stmt := "SELECT COUNT(*) FROM " + s.tableName(t.Name) + " WHERE " + s.where(t, where, p, "")
-	rows, err := s.q.QueryContext(ctx, stmt, p.vals...)
+	rows, err := s.query(ctx, stmt, p.vals)
 	if err != nil {
 		return 0, err
 	}
@@ -722,7 +777,7 @@ func (s *Store) Delete(ctx context.Context, table string, where ablage.Cond) (in
 	cond := s.where(t, where, p, "")
 	var n int64 = -1
 	if _, ok := s.d.(sqliteDialect); ok && selfCascade(t) {
-		rows, err := s.q.QueryContext(ctx, "SELECT COUNT(*) FROM "+s.tableName(t.Name)+" WHERE "+cond, p.vals...)
+		rows, err := s.query(ctx, "SELECT COUNT(*) FROM "+s.tableName(t.Name)+" WHERE "+cond, p.vals)
 		if err != nil {
 			return 0, err
 		}
@@ -755,4 +810,122 @@ func selfCascade(t ablage.Table) bool {
 		}
 	}
 	return false
+}
+
+var _ ablage.Aggregator = (*Store)(nil)
+
+// Aggregate implements ablage.Aggregator.
+func (s *Store) Aggregate(ctx context.Context, table string, a ablage.Aggregation) ([]ablage.Row, error) {
+	t, err := s.table(table)
+	if err != nil {
+		return nil, err
+	}
+	if a, err = t.CheckAggregation(a); err != nil {
+		return nil, err
+	}
+	p := &args{d: s.d}
+	type out struct {
+		name string
+		typ  ablage.Type
+		sum  bool // two columns: the sums of the high and low 32 bits
+	}
+	var cols []string
+	var outs []out
+	for _, g := range a.GroupBy {
+		f, _ := t.Field(g)
+		cols = append(cols, s.d.selectExpr(quote(g), f.Type))
+		outs = append(outs, out{name: g, typ: f.Type})
+	}
+	for _, v := range a.Values {
+		col := "*"
+		if v.Field != "" {
+			col = quote(v.Field)
+		}
+		f, _ := t.Field(v.Field)
+		switch v.Op {
+		case ablage.AggCount:
+			cols = append(cols, "COUNT("+col+")")
+			outs = append(outs, out{name: v.As, typ: ablage.Int})
+		case ablage.AggSum:
+			// In two halves, so no partial sum can overflow (SQLite would
+			// fail on one even if the total fits): high 32 bits (shifted
+			// with the sign) and low 32 bits, added up in Go.
+			// Each half fits into a BIGINT for up to 2^31 rows.
+			cols = append(cols, "CAST(COALESCE(SUM("+col+" >> 32), 0) AS BIGINT)", "CAST(COALESCE(SUM("+col+" & 4294967295), 0) AS BIGINT)")
+			outs = append(outs, out{name: v.As, typ: ablage.Int, sum: true})
+		case ablage.AggMin:
+			cols = append(cols, "MIN("+s.d.ordered(col, f.Type)+")")
+			outs = append(outs, out{name: v.As, typ: f.Type})
+		case ablage.AggMax:
+			cols = append(cols, "MAX("+s.d.ordered(col, f.Type)+")")
+			outs = append(outs, out{name: v.As, typ: f.Type})
+		}
+	}
+	var b strings.Builder
+	b.WriteString("SELECT " + strings.Join(cols, ", ") + " FROM " + s.tableName(t.Name) + " WHERE " + s.where(t, a.Where, p, ""))
+	if len(a.GroupBy) > 0 {
+		group := make([]string, len(a.GroupBy))
+		order := make([]string, len(a.GroupBy))
+		for i, g := range a.GroupBy {
+			f, _ := t.Field(g)
+			group[i] = quote(g)
+			order[i] = s.d.ordered(quote(g), f.Type) + s.d.nullsOrder(false)
+		}
+		b.WriteString(" GROUP BY " + strings.Join(group, ", ") + " ORDER BY " + strings.Join(order, ", "))
+	}
+	rows, err := s.query(ctx, b.String(), p.vals)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	result := []ablage.Row{}
+	for rows.Next() {
+		vals := make([]any, len(cols))
+		ptrs := make([]any, len(cols))
+		for i := range vals {
+			ptrs[i] = &vals[i]
+		}
+		if err := rows.Scan(ptrs...); err != nil {
+			return nil, err
+		}
+		row := make(ablage.Row, len(outs))
+		i := 0
+		for _, o := range outs {
+			if o.sum {
+				v, err := s.sum(vals[i], vals[i+1])
+				if err != nil {
+					return nil, fmt.Errorf("%w (%s.%s)", err, t.Name, o.name)
+				}
+				row[o.name] = v
+				i += 2
+				continue
+			}
+			v, err := s.d.decode(o.typ, vals[i])
+			if err != nil {
+				return nil, fmt.Errorf("%w (%s.%s)", err, t.Name, o.name)
+			}
+			row[o.name] = v
+			i++
+		}
+		result = append(result, row)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("sqlstore: aggregate %s: %w", t.Name, err)
+	}
+	return result, nil
+}
+
+// sum adds the sums of the high and low halves of an Int column.
+func (s *Store) sum(hi, lo any) (int64, error) {
+	h, ok1 := hi.(int64)
+	l, ok2 := lo.(int64)
+	if !ok1 || !ok2 {
+		return 0, fmt.Errorf("sqlstore: cannot read the sum from %T and %T", hi, lo)
+	}
+	total := new(big.Int).Lsh(big.NewInt(h), 32)
+	total.Add(total, big.NewInt(l))
+	if !total.IsInt64() {
+		return 0, errors.New("sqlstore: the sum does not fit into an int64")
+	}
+	return total.Int64(), nil
 }

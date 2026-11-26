@@ -3,8 +3,10 @@ package ablage_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/netip"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -544,4 +546,213 @@ func TestPatchChecksTheGoType(t *testing.T) {
 	if _, err := r.Get(ctx, e.ID); err != nil {
 		t.Errorf("entity unreadable: %v", err)
 	}
+}
+
+// GetMany takes as many ids as an app has, e.g. every row a page of other
+// rows refers to, and still applies scope and soft delete.
+func TestGetManyLong(t *testing.T) {
+	forEach(t, func(t *testing.T, s ablage.Store) {
+		r := customers(t, s)
+		var ids []string
+		must(t, s.Tx(t1, func(tx ablage.Store) error {
+			for i := range 200 {
+				ctx, tenant := t1, "t1"
+				if i%4 == 0 {
+					ctx, tenant = t2, "t2"
+				}
+				c := Customer{TenantID: tenant, Email: strconv.Itoa(i)}
+				must(t, r.With(tx).Create(ctx, &c))
+				ids = append(ids, c.ID)
+			}
+			return nil
+		}))
+		must(t, r.Delete(t1, ids[1]))
+		for i := range 70000 {
+			ids = append(ids, "missing"+strconv.Itoa(i))
+		}
+		got, err := r.GetMany(t1, ids...)
+		must(t, err)
+		if len(got) != 149 {
+			t.Errorf("GetMany: %d, want 149", len(got))
+		}
+		n, err := r.Count(t1, ablage.In("id", ids...))
+		must(t, err)
+		if n != 149 {
+			t.Errorf("Count: %d, want 149", n)
+		}
+	})
+}
+
+// An Incr in Patch adds to the field in one step, also when writers race.
+func TestPatchIncr(t *testing.T) {
+	forEach(t, func(t *testing.T, s ablage.Store) {
+		r := customers(t, s)
+		c := Customer{TenantID: "t1", Email: "a@x", Credit: 5}
+		must(t, r.Create(t1, &c))
+		var wg sync.WaitGroup
+		for range 10 {
+			wg.Go(func() {
+				if err := r.Patch(t1, c.ID, ablage.Row{"credit": ablage.Incr(2)}); err != nil {
+					t.Error(err)
+				}
+			})
+		}
+		wg.Wait()
+		must(t, r.Patch(t1, c.ID, ablage.Row{"credit": ablage.Incr(-3), "name": "N"}))
+		got, err := r.Get(t1, c.ID)
+		must(t, err)
+		if got.Credit != 22 || got.Name != "N" || got.Version != 12 || !got.UpdatedAt.After(c.UpdatedAt) {
+			t.Errorf("after patches: credit %d, name %q, version %d", got.Credit, got.Name, got.Version)
+		}
+		for _, set := range []ablage.Row{{"name": ablage.Incr(1)}, {"rating": ablage.Incr(1)}, {"version": ablage.Incr(1)}} {
+			if err := r.Patch(t1, c.ID, set); err == nil {
+				t.Errorf("patch %v accepted", set)
+			}
+		}
+	})
+}
+
+func TestUpdateWhere(t *testing.T) {
+	forEach(t, func(t *testing.T, s ablage.Store) {
+		r := customers(t, s)
+		var ids []string
+		for i, tenant := range []string{"t1", "t1", "t1", "t2"} {
+			c := Customer{TenantID: tenant, Email: strconv.Itoa(i), Name: "bulk", Credit: 1}
+			must(t, r.Create(withTenant(context.Background(), tenant), &c))
+			ids = append(ids, c.ID)
+		}
+		must(t, r.Delete(t1, ids[2]))
+		n, err := r.UpdateWhere(t1, ablage.Eq("name", "bulk"), ablage.Row{"status": Status("x"), "credit": ablage.Incr(10)})
+		must(t, err)
+		if n != 2 {
+			t.Errorf("changed %d, want 2 (live, in scope)", n)
+		}
+		list, err := r.Unscoped().WithDeleted().Find(context.Background(), ablage.Query{})
+		must(t, err)
+		for i, c := range list {
+			changed := i < 2
+			if (c.Status == "x") != changed || (c.Credit == 11) != changed || (c.Version == 2) != (i < 3) {
+				t.Errorf("entity %d: status %q, credit %d, version %d", i, c.Status, c.Credit, c.Version)
+			}
+			if changed && !c.UpdatedAt.After(c.CreatedAt) {
+				t.Errorf("entity %d: updated not stamped", i)
+			}
+		}
+		// WithDeleted reaches the deleted one, Unscoped every tenant.
+		n, err = r.WithDeleted().UpdateWhere(t1, ablage.Eq("id", ids[2]), ablage.Row{"name": "gone"})
+		must(t, err)
+		if n != 1 {
+			t.Errorf("WithDeleted changed %d", n)
+		}
+		n, err = r.Unscoped().UpdateWhere(context.Background(), ablage.All, ablage.Row{"credit": ablage.Incr(1)})
+		must(t, err)
+		if n != 3 {
+			t.Errorf("Unscoped changed %d, want 3", n)
+		}
+		for _, set := range []ablage.Row{{}, {"id": "x"}, {"version": 1}, {"updated_at": time.Now()}, {"deleted_at": nil},
+			{"tenant_id": "t2"}, {"nope": 1}, {"name": ablage.Incr(1)}} {
+			if _, err := r.UpdateWhere(t1, ablage.All, set); err == nil {
+				t.Errorf("update %v accepted", set)
+			}
+		}
+		if _, err := r.UpdateWhere(context.Background(), ablage.All, ablage.Row{"name": "x"}); err == nil {
+			t.Error("update without a tenant accepted")
+		}
+	})
+}
+
+func TestAggregate(t *testing.T) {
+	forEach(t, func(t *testing.T, s ablage.Store) {
+		r := customers(t, s)
+		for i, c := range []Customer{
+			{TenantID: "t1", Status: "a", Credit: 1}, {TenantID: "t1", Status: "a", Credit: 2},
+			{TenantID: "t1", Status: "b", Credit: 4}, {TenantID: "t1", Status: "b", Credit: 8},
+			{TenantID: "t2", Status: "a", Credit: 16},
+		} {
+			c.Email = strconv.Itoa(i)
+			must(t, r.Create(withTenant(context.Background(), c.TenantID), &c))
+			if i == 3 {
+				must(t, r.Delete(t1, c.ID))
+			}
+		}
+		a := ablage.Aggregation{GroupBy: []string{"status"}, Values: []ablage.Agg{ablage.CountAll("n"), ablage.Sum("credit", "credit")}}
+		check := func(r *ablage.Repository[Customer], ctx context.Context, want string) {
+			t.Helper()
+			got, err := r.Aggregate(ctx, a)
+			must(t, err)
+			if fmt.Sprint(got) != want {
+				t.Errorf("got %v, want %s", got, want)
+			}
+		}
+		check(r, t1, "[map[credit:3 n:2 status:a] map[credit:4 n:1 status:b]]")
+		check(r.WithDeleted(), t1, "[map[credit:3 n:2 status:a] map[credit:12 n:2 status:b]]")
+		check(r.Unscoped(), context.Background(), "[map[credit:19 n:3 status:a] map[credit:4 n:1 status:b]]")
+		if _, err := r.Aggregate(context.Background(), a); err == nil {
+			t.Error("aggregate without a tenant accepted")
+		}
+	})
+}
+
+// plainStore hides every method beyond ablage.Store.
+type plainStore struct{ ablage.Store }
+
+func TestAggregateUnsupported(t *testing.T) {
+	r, err := ablage.NewRepository[Customer](plainStore{ablagememory()}, "customers")
+	must(t, err)
+	must(t, r.Store().Migrate(context.Background()))
+	_, err = r.Aggregate(context.Background(), ablage.Aggregation{Values: []ablage.Agg{ablage.CountAll("n")}})
+	expectErr(t, err, ablage.ErrUnsupported)
+}
+
+func TestUpsertOn(t *testing.T) {
+	forEach(t, func(t *testing.T, s ablage.Store) {
+		r := customers(t, s, ablage.WithUniqueIndex("tenant_id", "name"))
+		first := Customer{TenantID: "t1", Email: "a@x", Name: "n"}
+		must(t, r.Create(t1, &first))
+		// Same tenant and name: the existing entity is overwritten and keeps
+		// its id and created time.
+		e := Customer{TenantID: "t1", Email: "b@x", Name: "n", Credit: 5}
+		must(t, r.UpsertOn(t1, &e, "name", "tenant_id"))
+		if e.ID != first.ID || e.Version != 2 || e.Credit != 5 || e.Email != "b@x" || !e.CreatedAt.Equal(first.CreatedAt) {
+			t.Errorf("after upsert: %+v", e)
+		}
+		if n, _ := r.Count(t1, ablage.All); n != 1 {
+			t.Errorf("%d entities, want 1", n)
+		}
+		// Another name: a new entity.
+		other := Customer{TenantID: "t1", Email: "c@x", Name: "m"}
+		must(t, r.UpsertOn(t1, &other, "tenant_id", "name"))
+		if other.ID == first.ID || other.Version != 1 {
+			t.Errorf("new entity: %+v", other.Base)
+		}
+		// A deleted entity does not count.
+		must(t, r.Delete(t1, first.ID))
+		again := Customer{TenantID: "t1", Email: "d@x", Name: "n"}
+		must(t, r.UpsertOn(t1, &again, "tenant_id", "name"))
+		if again.ID == first.ID || again.Version != 1 {
+			t.Errorf("upsert next to a deleted entity: %+v", again.Base)
+		}
+		if old, _ := r.WithDeleted().Get(t1, first.ID); old.DeletedAt == nil || old.Email != "b@x" {
+			t.Errorf("deleted entity changed: %+v", old)
+		}
+		// The e-mail is unique across tenants: another tenant's entity is
+		// out of scope and stays as it is.
+		foreign := Customer{TenantID: "t2", Email: "z@x", Name: "f"}
+		must(t, r.Create(t2, &foreign))
+		expectErr(t, r.UpsertOn(t1, &Customer{TenantID: "t1", Email: "z@x", Name: "x"}, "email"), ablage.ErrOutOfScope)
+		if got, _ := r.Get(t2, foreign.ID); got.Name != "f" || got.Version != 1 {
+			t.Errorf("t1 changed t2's entity: %+v", got)
+		}
+		expectErr(t, r.UpsertOn(t1, &Customer{TenantID: "t2", Email: "y@x"}, "email"), ablage.ErrOutOfScope)
+		if err := r.UpsertOn(t1, &Customer{TenantID: "t1", Email: "q@x"}, "name"); err == nil {
+			t.Error("upsert on a field without a unique index accepted")
+		}
+	})
+}
+
+func TestUpsertOnUnsupported(t *testing.T) {
+	r, err := ablage.NewRepository[Customer](plainStore{ablagememory()}, "customers")
+	must(t, err)
+	must(t, r.Store().Migrate(context.Background()))
+	expectErr(t, r.UpsertOn(context.Background(), &Customer{Email: "a@x"}, "email"), ablage.ErrUnsupported)
 }

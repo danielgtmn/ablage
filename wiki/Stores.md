@@ -26,6 +26,17 @@ Tables go into the `search_path` schema. Storage: TEXT with collation "C" (byte 
 
 `memstore.New()`: for tests. Every operation and transaction holds one lock (serializable); data is gone when the process ends.
 
+## Long lists and parameters
+
+Values go to the database as parameters, never inside the SQL text. An
+`In` list with 100 values or more is passed as one parameter (a JSON array
+in SQLite, an array in Postgres), so `In` has no length limit. Other
+conditions take one parameter per value; a statement with more than SQLite
+(32,766) or Postgres (65,535) allow fails with an error saying so. Only a
+condition with thousands of separate comparisons gets there: use `In`
+instead. Long `In` lists over a bytes field need SQLite 3.41 or later
+(`unhex`).
+
 ## Errors
 
 Constraint violations are mapped to `ablage.ErrDuplicate` and `ablage.ErrReference`, wrapping the driver error. `Delete` returns the number of rows the condition matched, not counting rows of other tables removed by a cascade.

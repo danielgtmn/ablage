@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -275,6 +276,22 @@ func TestMigrateAdoptsExistingTable(t *testing.T) {
 			if n, _ := s.Count(ctx, "users", ablage.Prefix("name", "a")); n != 2 {
 				t.Errorf("names starting with a: %d, want 2", n)
 			}
+			// Aggregates compare by bytes too.
+			agg, err := s.Aggregate(ctx, "users", ablage.Aggregation{GroupBy: []string{"name"},
+				Values: []ablage.Agg{ablage.Min("name", "lo"), ablage.Max("email", "hi")}})
+			must(t, err)
+			got = got[:0]
+			for _, r := range agg {
+				got = append(got, r["name"].(string))
+			}
+			if want := "B a ab b Ä"; strings.Join(got, " ") != want {
+				t.Errorf("groups %v, want %s", got, want)
+			}
+			agg, err = s.Aggregate(ctx, "users", ablage.Aggregation{Values: []ablage.Agg{ablage.Min("name", "lo"), ablage.Max("name", "hi")}})
+			must(t, err)
+			if agg[0]["lo"] != "B" || agg[0]["hi"] != "Ä" {
+				t.Errorf("min and max %v, want B and Ä", agg[0])
+			}
 		})
 	}
 }
@@ -295,4 +312,31 @@ func indexNames(t *testing.T, conn *sql.DB, d sqlstore.Dialect, table string) ma
 		out[n] = true
 	}
 	return out
+}
+
+// A condition with more separate comparisons than the database takes
+// parameters fails with an error saying so; a long In list does not.
+func TestTooManyParameters(t *testing.T) {
+	for _, d := range dbs {
+		t.Run(d.name, func(t *testing.T) {
+			s := testdb.Store(t, d.open(t), d.dialect)
+			must(t, s.Declare(ablage.Table{Name: "items"}))
+			must(t, s.Migrate(ctx))
+			var or []ablage.Cond
+			var ids []string
+			for i := range 70000 {
+				or = append(or, ablage.Eq("id", fmt.Sprint(i)))
+				ids = append(ids, fmt.Sprint(i))
+			}
+			if _, err := s.Count(ctx, "items", ablage.Or(or...)); err == nil || !strings.Contains(err.Error(), "parameters") {
+				t.Errorf("70,000 comparisons: %v", err)
+			}
+			if _, err := s.Delete(ctx, "items", ablage.Or(or...)); err == nil || !strings.Contains(err.Error(), "parameters") {
+				t.Errorf("70,000 comparisons in a delete: %v", err)
+			}
+			if _, err := s.Count(ctx, "items", ablage.In("id", ids...)); err != nil {
+				t.Errorf("70,000 values in In: %v", err)
+			}
+		})
+	}
 }
