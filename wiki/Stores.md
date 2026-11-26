@@ -20,7 +20,7 @@ db, _ := sql.Open("pgx", "postgres://user@host/db")
 store, err := sqlstore.New(db, sqlstore.Postgres)
 ```
 
-Tables go into the `search_path` schema. Storage: TEXT with collation "C" (byte order, as in the other stores), BIGINT, DOUBLE PRECISION, BOOLEAN, TIMESTAMPTZ, BYTEA, JSONB.
+Tables go into the `search_path` schema. Storage: TEXT with collation "C" (byte order, as in the other stores), BIGINT, DOUBLE PRECISION, BOOLEAN, TIMESTAMPTZ, BYTEA, JSONB. String columns of tables created before ablage may have another collation (the database default, usually language rules); ablage compares and sorts them by bytes all the same, but `Lt`, `Gt`, `Prefix` and sorting on such a column cannot use its index.
 
 ## Memory
 

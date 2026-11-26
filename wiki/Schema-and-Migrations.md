@@ -53,6 +53,10 @@ Tables may be declared in any order; Migrate creates referenced tables first. A 
 - No table or column is dropped, renamed or changed. Renaming a struct field or tag creates a new, empty column; keep the old name with a `db` tag instead.
 - Indexes follow the declaration: an index ablage created earlier that is no longer declared is dropped (indexes hold no data). This is how a unique index becomes one over live rows when soft delete is added. Indexes you create yourself are left alone.
 
+### Tables that existed before ablage
+
+Migrate also takes over tables an app created before it used ablage (with its own SQL or an older data layer), as long as their columns have the types ablage uses (see [Stores](Stores)): declare the table with the same field names and it adds only what is missing. An existing index that is exactly the one a declaration asks for (same columns in the same order, same uniqueness, ascending, no condition, no expression) is replaced by ablage's own under ablage's name, so the table does not end up with every index twice. Any other index of yours stays.
+
 Declaring the same table twice with different definitions in one process is an error.
 
 `sqlstore.Store.DDL()` returns the statements for an empty database, for apps that keep their own migration files. `sqlstore.WithPrefix("app_")` puts a prefix before every table name, so several libraries can share a database.

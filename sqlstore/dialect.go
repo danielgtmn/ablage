@@ -1,6 +1,8 @@
 package sqlstore
 
 import (
+	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -44,10 +46,16 @@ type dialect interface {
 	noLimit() string
 	// selectExpr is how a column is read.
 	selectExpr(col string, t ablage.Type) string
+	// ordered is how a column is compared with <, > and sorted: by bytes
+	// for strings, whatever collation the column has.
+	ordered(col string, t ablage.Type) string
 	encode(t ablage.Type, v any) any
 	decode(t ablage.Type, v any) (any, error)
 	columnsQuery() string // one argument: the table name
 	indexesQuery() string // one argument: the table name
+	// plainIndexes lists the indexes of a table that Migrate may replace
+	// by an identical one of its own (see Store.adoptIndexes).
+	plainIndexes(ctx context.Context, q querier, table string) ([]plainIndex, error)
 	// errKind maps a driver error to ablage.ErrDuplicate or
 	// ablage.ErrReference, or nil.
 	errKind(err error) error
@@ -71,6 +79,10 @@ func (sqliteDialect) nullsOrder(desc bool) string {
 func (sqliteDialect) columnsQuery() string                        { return `SELECT name FROM pragma_table_info(?)` }
 func (sqliteDialect) indexesQuery() string                        { return `SELECT name FROM pragma_index_list(?)` }
 func (sqliteDialect) selectExpr(col string, _ ablage.Type) string { return col }
+
+// ordered: TEXT columns ablage creates compare by bytes (BINARY), and so do
+// columns created without a collation, as older tables usually are.
+func (sqliteDialect) ordered(col string, _ ablage.Type) string { return col }
 
 func (sqliteDialect) columnType(t ablage.Type) string {
 	switch t {
@@ -222,6 +234,17 @@ func (postgresDialect) selectExpr(col string, t ablage.Type) string {
 	return col
 }
 
+// ordered compares strings by bytes also in columns created with another
+// collation (e.g. by an older version of the app before it used ablage).
+// On columns ablage created, which have collation "C", this changes
+// nothing and indexes are used as before.
+func (postgresDialect) ordered(col string, t ablage.Type) string {
+	if t == ablage.String {
+		return col + ` COLLATE "C"`
+	}
+	return col
+}
+
 func (postgresDialect) columnType(t ablage.Type) string {
 	switch t {
 	case ablage.String:
@@ -332,4 +355,95 @@ func (postgresDialect) errKind(err error) error {
 		return ablage.ErrReference
 	}
 	return nil
+}
+
+// plainIndexes lists the indexes SQLite may replace: created with CREATE
+// INDEX (not by a constraint), without WHERE, over plain columns in
+// ascending order with the BINARY collation.
+func (sqliteDialect) plainIndexes(ctx context.Context, q querier, table string) ([]plainIndex, error) {
+	rows, err := q.QueryContext(ctx, `SELECT name, "unique" FROM pragma_index_list(?) WHERE origin = 'c' AND partial = 0`, table)
+	if err != nil {
+		return nil, err
+	}
+	var list []plainIndex
+	for rows.Next() {
+		var ix plainIndex
+		if err := rows.Scan(&ix.name, &ix.unique); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		list = append(list, ix)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	var out []plainIndex
+	for _, ix := range list {
+		cols, err := q.QueryContext(ctx, `SELECT name, "desc", coll FROM pragma_index_xinfo(?) WHERE key = 1 ORDER BY seqno`, ix.name)
+		if err != nil {
+			return nil, err
+		}
+		plain := true
+		for cols.Next() {
+			var name sql.NullString
+			var desc bool
+			var coll string
+			if err := cols.Scan(&name, &desc, &coll); err != nil {
+				cols.Close()
+				return nil, err
+			}
+			if !name.Valid || desc || coll != "BINARY" {
+				plain = false // an expression, descending or another collation
+			}
+			ix.columns = append(ix.columns, name.String)
+		}
+		cols.Close()
+		if err := cols.Err(); err != nil {
+			return nil, err
+		}
+		if plain && len(ix.columns) > 0 {
+			out = append(out, ix)
+		}
+	}
+	return out, nil
+}
+
+// plainIndexes lists the indexes Postgres may replace: btree, not backing a
+// constraint, without WHERE, expressions or INCLUDE, every key column
+// ascending with its own collation and the default operator class.
+func (postgresDialect) plainIndexes(ctx context.Context, q querier, table string) ([]plainIndex, error) {
+	rows, err := q.QueryContext(ctx, `
+SELECT i.relname, x.indisunique, k.cols
+FROM pg_index x
+JOIN pg_class i ON i.oid = x.indexrelid
+JOIN pg_class t ON t.oid = x.indrelid
+JOIN pg_namespace n ON n.oid = t.relnamespace
+JOIN pg_am am ON am.oid = i.relam
+CROSS JOIN LATERAL (
+	SELECT string_agg(a.attname, ',' ORDER BY u.ord) AS cols,
+		bool_and(a.attnum IS NOT NULL AND u.coll = a.attcollation AND u.opt = 0 AND oc.opcdefault) AS plain
+	FROM unnest(x.indkey::int2[], x.indcollation::oid[], x.indclass::oid[], x.indoption::int2[])
+		WITH ORDINALITY AS u(attnum, coll, opc, opt, ord)
+	LEFT JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = u.attnum AND u.attnum > 0
+	JOIN pg_opclass oc ON oc.oid = u.opc
+) k
+WHERE n.nspname = current_schema() AND t.relname = $1 AND am.amname = 'btree'
+	AND x.indpred IS NULL AND x.indexprs IS NULL AND x.indnkeyatts = x.indnatts AND k.plain
+	AND NOT EXISTS (SELECT 1 FROM pg_constraint c WHERE c.conindid = x.indexrelid)`, table)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []plainIndex
+	for rows.Next() {
+		var ix plainIndex
+		var cols string
+		if err := rows.Scan(&ix.name, &ix.unique, &cols); err != nil {
+			return nil, err
+		}
+		ix.columns = strings.Split(cols, ",")
+		out = append(out, ix)
+	}
+	return out, rows.Err()
 }
