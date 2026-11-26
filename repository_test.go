@@ -581,3 +581,32 @@ func TestGetManyLong(t *testing.T) {
 		}
 	})
 }
+
+// An Incr in Patch adds to the field in one step, also when writers race.
+func TestPatchIncr(t *testing.T) {
+	forEach(t, func(t *testing.T, s ablage.Store) {
+		r := customers(t, s)
+		c := Customer{TenantID: "t1", Email: "a@x", Credit: 5}
+		must(t, r.Create(t1, &c))
+		var wg sync.WaitGroup
+		for range 10 {
+			wg.Go(func() {
+				if err := r.Patch(t1, c.ID, ablage.Row{"credit": ablage.Incr(2)}); err != nil {
+					t.Error(err)
+				}
+			})
+		}
+		wg.Wait()
+		must(t, r.Patch(t1, c.ID, ablage.Row{"credit": ablage.Incr(-3), "name": "N"}))
+		got, err := r.Get(t1, c.ID)
+		must(t, err)
+		if got.Credit != 22 || got.Name != "N" || got.Version != 12 || !got.UpdatedAt.After(c.UpdatedAt) {
+			t.Errorf("after patches: credit %d, name %q, version %d", got.Credit, got.Name, got.Version)
+		}
+		for _, set := range []ablage.Row{{"name": ablage.Incr(1)}, {"rating": ablage.Incr(1)}, {"version": ablage.Incr(1)}} {
+			if err := r.Patch(t1, c.ID, set); err == nil {
+				t.Errorf("patch %v accepted", set)
+			}
+		}
+	})
+}

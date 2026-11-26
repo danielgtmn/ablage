@@ -396,8 +396,8 @@ func (r *Repository[T]) Update(ctx context.Context, id string, fn func(*T) error
 }
 
 // Patch sets single fields by column name, without reading the entity
-// first. Values are given as in the struct (e.g. a slice for a JSON field).
-// The id, managed fields and fields of the scope cannot be patched. It
+// first. Values are given as in the struct (e.g. a slice for a JSON field);
+// an Incr adds to an integer field in one atomic step instead. The id, managed fields and fields of the scope cannot be patched. It
 // increments the version and sets updated.
 func (r *Repository[T]) Patch(ctx context.Context, id string, set Row) error {
 	if len(set) == 0 {
@@ -422,6 +422,12 @@ func (r *Repository[T]) Patch(ctx context.Context, id string, set Row) error {
 		}
 		if slices.Contains(scopeFields, name) {
 			return fmt.Errorf("ablage: %s.%s is part of the scope and cannot be patched", r.table.Name, name)
+		}
+		if inc, ok := val.(Incr); ok {
+			// The store adds it; it checks the field is an integer that is
+			// not nullable.
+			out[name] = inc
+			continue
 		}
 		cv, err := c.value(val)
 		if err == nil {
