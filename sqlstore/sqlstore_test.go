@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -194,4 +195,104 @@ func TestMigrateAddsSoftDelete(t *testing.T) {
 			}
 		})
 	}
+}
+
+// A table created before the app used ablage (by its own SQL, or by an
+// older layer) keeps working: Migrate replaces identical indexes by its own
+// instead of adding each a second time, leaves other indexes alone, and
+// strings compare and sort by bytes even though the Postgres columns have
+// the database's collation.
+func TestMigrateAdoptsExistingTable(t *testing.T) {
+	for _, d := range dbs {
+		t.Run(d.name, func(t *testing.T) {
+			conn := d.open(t)
+			// Postgres on most systems sorts text by language rules ("a" < "B");
+			// the Alpine image used in tests sorts by bytes, so ask for a
+			// language collation explicitly.
+			time, text := "INTEGER", "TEXT"
+			if d.dialect == sqlstore.Postgres {
+				time, text = "TIMESTAMPTZ", `TEXT COLLATE "und-x-icu"`
+			}
+			for _, stmt := range []string{
+				`CREATE TABLE "old_users" ("id" ` + text + ` NOT NULL PRIMARY KEY, "email" ` + text + `, "name" ` + text + ` NOT NULL, "seen" ` + time + ` NOT NULL)`,
+				`CREATE UNIQUE INDEX "old_users_email_key" ON "old_users" ("email")`,
+				`CREATE INDEX "old_users_seen_idx" ON "old_users" ("seen")`,
+				`CREATE INDEX "old_users_by_name" ON "old_users" ("name", "seen")`, // not declared: stays
+				`CREATE INDEX "old_users_name_desc" ON "old_users" ("name" DESC)`,  // not identical: stays
+			} {
+				if _, err := conn.Exec(stmt); err != nil {
+					t.Fatal(err)
+				}
+			}
+			s := testdb.Store(t, conn, d.dialect, sqlstore.WithPrefix("old_"))
+			must(t, s.Declare(ablage.Table{Name: "users", Fields: []ablage.Field{
+				{Name: "email", Type: ablage.String, Nullable: true, Unique: true},
+				{Name: "name", Type: ablage.String, Index: true},
+				{Name: "seen", Type: ablage.Time, Index: true},
+			}}))
+			must(t, s.Migrate(ctx))
+			must(t, s.Migrate(ctx))
+
+			names := indexNames(t, conn, d.dialect, "old_users")
+			for _, gone := range []string{"old_users_email_key", "old_users_seen_idx"} {
+				if names[gone] {
+					t.Errorf("identical index %s kept next to ablage's", gone)
+				}
+			}
+			for _, kept := range []string{"old_users_by_name", "old_users_name_desc"} {
+				if !names[kept] {
+					t.Errorf("index %s dropped", kept)
+				}
+			}
+			managed := 0
+			for n := range names {
+				if strings.HasSuffix(n, "_key") || strings.HasSuffix(n, "_idx") {
+					managed++
+				}
+			}
+			if managed != 3 {
+				t.Errorf("want 3 indexes of ablage, have %v", names)
+			}
+
+			for _, n := range []string{"a", "B", "b", "Ä", "ab"} {
+				must(t, s.Insert(ctx, "users", ablage.Row{"id": n, "name": n, "email": n + "@x"}))
+			}
+			if err := s.Insert(ctx, "users", ablage.Row{"id": "dup", "name": "d", "email": "a@x"}); !errors.Is(err, ablage.ErrDuplicate) {
+				t.Errorf("unique e-mail: %v", err)
+			}
+			rows, err := s.Find(ctx, "users", ablage.Query{OrderBy: []ablage.Order{ablage.Asc("name")}})
+			must(t, err)
+			var got []string
+			for _, r := range rows {
+				got = append(got, r["name"].(string))
+			}
+			if want := "B a ab b Ä"; strings.Join(got, " ") != want {
+				t.Errorf("order %v, want %s", got, want)
+			}
+			if n, _ := s.Count(ctx, "users", ablage.Gt("name", "Z")); n != 4 {
+				t.Errorf("names after Z: %d, want 4", n)
+			}
+			if n, _ := s.Count(ctx, "users", ablage.Prefix("name", "a")); n != 2 {
+				t.Errorf("names starting with a: %d, want 2", n)
+			}
+		})
+	}
+}
+
+func indexNames(t *testing.T, conn *sql.DB, d sqlstore.Dialect, table string) map[string]bool {
+	t.Helper()
+	q := `SELECT name FROM pragma_index_list(?)`
+	if d == sqlstore.Postgres {
+		q = `SELECT indexname FROM pg_indexes WHERE schemaname = current_schema() AND tablename = $1`
+	}
+	rows, err := conn.Query(q, table)
+	must(t, err)
+	defer rows.Close()
+	out := map[string]bool{}
+	for rows.Next() {
+		var n string
+		must(t, rows.Scan(&n))
+		out[n] = true
+	}
+	return out
 }
